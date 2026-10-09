@@ -76,6 +76,8 @@ vi.mock('@/hooks/use-vlm-judge-batch', () => ({
     inventory: {},
     jobs: {},
     approvals: {},
+    annotated: {},
+    usable: {},
     reset: {},
     review: {},
     act: vi.fn(),

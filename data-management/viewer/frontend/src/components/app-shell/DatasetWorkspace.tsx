@@ -1,16 +1,19 @@
-import { ChevronDown, ChevronLeft, ChevronRight, Play, RefreshCw, Square } from 'lucide-react'
-import { useState } from 'react'
+import { ChevronDown, ChevronLeft, Play, RefreshCw, Square } from 'lucide-react'
+import { useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { useEpisodeReadiness } from '@/hooks/use-episode-readiness'
 import { usePrincipalContext } from '@/hooks/use-principal-context'
 import { useJudgeDataset, useJudgeSamples, useVlmJudgeBatch } from '@/hooks/use-vlm-judge-batch'
+import { formatEpisodeList, parseEpisodeList } from '@/lib/episode-list'
 import { useEpisodeStore } from '@/stores'
 import type {
   JudgeResetPreview,
   JudgeSampleReference,
   JudgeWithdrawalField,
 } from '@/types/vlm-judge'
+
+const MAX_GROUNDING = 25
 
 function describeWithdrawal(field: JudgeWithdrawalField, completed: boolean): string {
   const runs = (ids?: string[]) => (ids?.length ? ` Runs: ${ids.join(', ')}.` : '')
@@ -84,12 +87,10 @@ function DatasetWorkspaceContent({
   unavailableReason,
   accessError,
 }: DatasetWorkspaceProps & { unavailableReason: string; accessError: boolean }) {
-  const [offset, setOffset] = useState(0)
-  const [targets, setTargets] = useState<number[]>([])
+  const [targetText, setTargetText] = useState('')
   const [method, setMethod] = useState('gvl')
   const [approvalId, setApprovalId] = useState('')
-  const [sampleIndices, setSampleIndices] = useState<number[]>([])
-  const [authors, setAuthors] = useState<Record<number, string>>({})
+  const [groundingText, setGroundingText] = useState<string | null>(null)
   const [reviewId, setReviewId] = useState<string>()
   const [acknowledgeExceptions, setAcknowledgeExceptions] = useState(false)
   const [preview, setPreview] = useState<JudgeResetPreview | null>(null)
@@ -98,14 +99,35 @@ function DatasetWorkspaceContent({
   const [jobOffset, setJobOffset] = useState(0)
   const [views, setViews] = useState<string[]>([])
   const availableCameras = useEpisodeStore((state) => state.currentEpisode?.cameras) ?? []
-  const workspace = useJudgeDataset(datasetId, offset, enabled, reviewId, snapshotId, jobOffset)
+  const workspace = useJudgeDataset(datasetId, enabled, reviewId, snapshotId, jobOffset)
   const batch = useVlmJudgeBatch(datasetId)
+  const inventoryItems = workspace.inventory.data?.items
+  const known = useMemo(
+    () => (inventoryItems ? new Set(inventoryItems) : undefined),
+    [inventoryItems],
+  )
+  const annotated = workspace.annotated.data
+  const usable = workspace.usable.data ?? (workspace.usable.error ? annotated : undefined)
+  const notUsable = usable ? (annotated ?? []).filter((index) => !usable.includes(index)) : []
+  const groundingValue = groundingText ?? formatEpisodeList((usable ?? []).slice(0, MAX_GROUNDING))
+  const grounding = parseEpisodeList(groundingValue, known)
+  const sampleIndices = grounding.indices
+  const groundingError =
+    grounding.error ??
+    (sampleIndices.length > MAX_GROUNDING
+      ? `Use at most ${MAX_GROUNDING} grounding episodes.`
+      : null)
+  const parsedTargets = parseEpisodeList(targetText, known)
+  const targets = targetText.trim()
+    ? parsedTargets.indices
+    : (inventoryItems ?? []).filter((index) => !sampleIndices.includes(index))
+  const targetError = targetText.trim() ? parsedTargets.error : null
   const readiness = useEpisodeReadiness(
     datasetId,
     [...new Set([...targets, ...sampleIndices])],
     open && enabled,
   )
-  const samples = useJudgeSamples(datasetId, sampleIndices, authors, open && enabled)
+  const samples = useJudgeSamples(datasetId, groundingError ? [] : sampleIndices, open && enabled)
   const jobs = workspace.jobs.data?.items ?? []
   const busy = batch.isPending || workspace.isPending
   const canMutate = enabled && !workspace.denied
@@ -133,6 +155,7 @@ function DatasetWorkspaceContent({
   const launchable =
     canMutate &&
     targets.length > 0 &&
+    !targetError &&
     !!approved &&
     !!approvalJob &&
     readiness.ready &&
@@ -140,14 +163,7 @@ function DatasetWorkspaceContent({
     !resetBlocked &&
     !workspace.inventory.error &&
     !workspace.approvals.error
-  const toggleTarget = (index: number) => {
-    setSnapshotId(workspace.inventory.data?.snapshotId)
-    setTargets((selected) =>
-      selected.includes(index)
-        ? selected.filter((value) => value !== index)
-        : [...selected, index].sort((first, second) => first - second),
-    )
-  }
+  const pinInventory = () => setSnapshotId(workspace.inventory.data?.snapshotId)
   const submit = (mode: 'judge' | 'judge-and-label') => {
     if (!launchable) return
     void batch
@@ -164,15 +180,16 @@ function DatasetWorkspaceContent({
   }
   const references = Object.fromEntries(
     (samples.data ?? [])
-      .filter(
-        (sample) =>
-          sample.reference && authors[sample.index] === sample.reference.annotationAuthorId,
-      )
+      .filter((sample) => sample.reference && sampleIndices.includes(sample.index))
       .map((sample) => [sample.index, sample.reference]),
   ) as Record<number, JudgeSampleReference>
+  const unusable = (samples.data ?? [])
+    .filter((sample) => !sample.reference && sampleIndices.includes(sample.index))
+    .map((sample) => sample.index)
   const samplesReady =
     canMutate &&
     sampleIndices.length > 0 &&
+    !groundingError &&
     sampleIndices.every((index) => !!references[index]) &&
     readiness.ready &&
     !samples.error &&
@@ -188,24 +205,28 @@ function DatasetWorkspaceContent({
         (!readiness.ready ? readiness.reason : null) ??
         missing)
   const sampleBlockReason = blockReason(
-    sampleIndices.length === 0
-      ? 'Select at least one validation sample.'
-      : samples.error
-        ? 'Saved sample references could not be loaded.'
-        : samples.isFetching
-          ? 'Loading saved human annotations.'
-          : !sampleIndices.every((index) => !!references[index])
-            ? 'Choose a human reference author for every validation sample.'
-            : null,
+    groundingError
+      ? 'Fix the grounding episode list.'
+      : sampleIndices.length === 0
+        ? 'Enter at least one grounding episode.'
+        : samples.error
+          ? 'Saved annotations could not be loaded.'
+          : samples.isFetching
+            ? 'Loading saved human annotations.'
+            : unusable.length
+              ? `Episodes ${formatEpisodeList(unusable)} need a saved human instruction and a success, failure or partial outcome.`
+              : null,
   )
   const targetBlockReason = blockReason(
-    targets.length === 0
-      ? 'Select at least one target episode.'
-      : !approved || !approvalJob
-        ? 'Evaluate validation samples, review them and approve the configuration first, or select a current approval.'
-        : workspace.inventory.error || workspace.approvals.error
-          ? 'Refresh the dataset state before submitting.'
-          : null,
+    targetError
+      ? 'Fix the target episode list.'
+      : targets.length === 0
+        ? 'Enter at least one target episode.'
+        : !approved || !approvalJob
+          ? 'Evaluate the grounding episodes, review them and approve the configuration first, or select a current approval.'
+          : workspace.inventory.error || workspace.approvals.error
+            ? 'Refresh the dataset state before submitting.'
+            : null,
   )
   const exceptions = review?.targets?.some((target) => target.comparison !== 'agreement')
   const evaluateSamples = () => {
@@ -265,7 +286,6 @@ function DatasetWorkspaceContent({
                 title="Refresh dataset jobs"
                 onClick={() => {
                   setSnapshotId(undefined)
-                  setOffset(0)
                   setPreview(null)
                   setAcknowledgeReset(false)
                   workspace.refresh()
@@ -287,129 +307,78 @@ function DatasetWorkspaceContent({
             {(workspace.error || batch.error) && (
               <p role="alert">Dataset operation failed. Refresh saved state before retrying.</p>
             )}
-            <section aria-label="Target selection" className="space-y-3">
-              <h3 className="font-semibold">Episodes</h3>
+            <section aria-label="Grounding episodes" className="space-y-3">
+              <h3 className="font-semibold">Grounding episodes</h3>
               <p className="text-muted-foreground text-sm">
-                Batch judging runs in order: choose validation samples and their human reference
-                authors, evaluate the samples, review and approve the configuration, then judge
-                targets. <strong>Target</strong> selects an episode for the batch.{' '}
-                <strong>Validation sample</strong> selects an episode with saved human annotations
-                used to check the judge before the batch runs.
+                Hand-annotated episodes are used to check the judge before the batch runs. Each
+                episode uses its latest saved annotation. Evaluate them, review the results and
+                approve the configuration, then judge the target episodes.
               </p>
-              {workspace.inventory.isPending && <p role="status">Loading episode inventory...</p>}
+              {(workspace.annotated.isPending ||
+                workspace.inventory.isPending ||
+                (annotated && workspace.usable.isPending)) && (
+                <p role="status">Loading annotated episodes...</p>
+              )}
               {workspace.inventory.error && (
                 <p role="alert">Episode inventory could not be loaded.</p>
               )}
-              <div className="flex flex-wrap gap-4">
-                {(workspace.inventory.data?.items ?? []).map((index) => (
-                  <div key={index} className="flex items-center gap-3">
-                    <label className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        aria-label={`Target episode ${index}`}
-                        checked={targets.includes(index)}
-                        onChange={() => toggleTarget(index)}
-                      />
-                      Target episode {index}
-                    </label>
-                    <label className="flex items-center gap-1 text-sm">
-                      <input
-                        type="checkbox"
-                        aria-label={`Validation sample episode ${index}`}
-                        checked={sampleIndices.includes(index)}
-                        disabled={!sampleIndices.includes(index) && sampleIndices.length >= 25}
-                        onChange={() => {
-                          setSnapshotId(workspace.inventory.data?.snapshotId)
-                          setSampleIndices((selected) =>
-                            selected.includes(index)
-                              ? selected.filter((value) => value !== index)
-                              : [...selected, index],
-                          )
-                        }}
-                      />
-                      Validation sample
-                    </label>
-                  </div>
-                ))}
-              </div>
-              <div className="flex items-center gap-3">
-                <Button
-                  variant="outline"
-                  size="icon"
-                  title="Previous target page"
-                  aria-label="Previous target page"
-                  disabled={!offset}
-                  onClick={() => setOffset(Math.max(0, offset - 25))}
-                >
-                  <ChevronLeft aria-hidden="true" className="size-4" />
-                </Button>
-                <span role="status">
-                  {targets.length} selected; {workspace.inventory.data?.total ?? 0} episodes
-                </span>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  title="Next target page"
-                  aria-label="Next target page"
-                  disabled={offset + 25 >= (workspace.inventory.data?.total ?? 0)}
-                  onClick={() => setOffset(offset + 25)}
-                >
-                  <ChevronRight aria-hidden="true" className="size-4" />
-                </Button>
-              </div>
-            </section>
-            <section aria-label="Validation samples" className="space-y-3">
-              <h3 className="font-semibold">Validation samples</h3>
-              <p className="text-muted-foreground text-sm">
-                For each sample, choose whose saved human annotation is the reference the judge is
-                compared against. This does not set who authors AI output.
-              </p>
-              {samples.error && (
+              {workspace.annotated.error && (
+                <p role="alert">Annotated episodes could not be loaded.</p>
+              )}
+              {workspace.usable.error && (
                 <p role="alert">
-                  Saved sample references could not be loaded. Refresh before evaluating.
+                  Saved annotations could not be checked. All annotated episodes are listed.
                 </p>
               )}
-              {(samples.data ?? [])
-                .filter((sample) => sampleIndices.includes(sample.index))
-                .map((sample) => (
-                  <div key={sample.index} className="space-y-1 border-b py-2 text-sm">
-                    <label className="flex flex-wrap items-center gap-2">
-                      Episode {sample.index} human reference author
-                      <select
-                        aria-label={`Episode ${sample.index} human reference author`}
-                        value={authors[sample.index] ?? ''}
-                        onChange={(event) =>
-                          setAuthors((current) => ({
-                            ...current,
-                            [sample.index]: event.target.value,
-                          }))
-                        }
-                        className="rounded border p-2"
-                      >
-                        <option value="">Select human reference</option>
-                        {sample.authors.map((author) => (
-                          <option key={author} value={author}>
-                            {author}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    {references[sample.index] && (
-                      <>
-                        <p className="break-all">{sample.reference?.annotationRevision}</p>
-                        <p>{sample.rating}</p>
-                        <p>{sample.instruction}</p>
-                      </>
-                    )}
-                  </div>
-                ))}
+              {annotated && usable && (
+                <div className="space-y-1 text-sm break-words">
+                  <p>
+                    {annotated.length} of {workspace.inventory.data?.total ?? '?'} episodes
+                    annotated; {usable.length} usable for grounding
+                    {usable.length ? `: ${formatEpisodeList(usable)}` : '.'}
+                  </p>
+                  {notUsable.length > 0 && <p>Not usable yet: {formatEpisodeList(notUsable)}.</p>}
+                </div>
+              )}
+              <div className="grid max-w-xl gap-1 text-sm">
+                <label htmlFor="grounding-episodes">Grounding episodes</label>
+                <input
+                  id="grounding-episodes"
+                  value={groundingValue}
+                  placeholder="0,2,4-8"
+                  aria-invalid={!!groundingError}
+                  aria-describedby={
+                    groundingError ? 'grounding-hint grounding-error' : 'grounding-hint'
+                  }
+                  onChange={(event) => {
+                    pinInventory()
+                    setGroundingText(event.target.value)
+                  }}
+                  className="rounded border p-2"
+                />
+                <p id="grounding-hint" className="text-muted-foreground">
+                  Comma-separated episode numbers or ranges, up to {MAX_GROUNDING} episodes. A
+                  grounding episode needs a saved success, failure or partial rating and a
+                  human-written task instruction; episode labels are not used.
+                </p>
+                {groundingError && (
+                  <p id="grounding-error" className="text-destructive">
+                    {groundingError}
+                  </p>
+                )}
+              </div>
+              {samples.error && (
+                <p role="alert">
+                  Saved annotations could not be loaded. Refresh before evaluating.
+                </p>
+              )}
               <Button
                 disabled={!enabled || !samplesReady}
                 aria-describedby={sampleBlockReason ? 'sample-block-reason' : undefined}
                 onClick={evaluateSamples}
               >
                 <Play aria-hidden="true" className="mr-1 size-4" />
-                Evaluate samples
+                Evaluate grounding episodes
               </Button>
               {sampleBlockReason && (
                 <p id="sample-block-reason" className="text-muted-foreground text-sm">
@@ -529,6 +498,34 @@ function DatasetWorkspaceContent({
                   {effectiveViews.join(', ') || 'all'}
                 </p>
               )}
+              <div className="grid max-w-xl basis-full gap-1 text-sm">
+                <label htmlFor="target-episodes">Target episodes</label>
+                <input
+                  id="target-episodes"
+                  value={targetText}
+                  placeholder="All episodes not used for grounding"
+                  aria-invalid={!!targetError}
+                  aria-describedby={targetError ? 'target-hint target-error' : 'target-hint'}
+                  onChange={(event) => {
+                    pinInventory()
+                    setTargetText(event.target.value)
+                  }}
+                  className="rounded border p-2"
+                />
+                <p id="target-hint" className="text-muted-foreground">
+                  Comma-separated episode numbers or ranges, such as 0,2,4-8. Leave empty to judge
+                  every episode not used for grounding.
+                </p>
+                {targetError && (
+                  <p id="target-error" className="text-destructive">
+                    {targetError}
+                  </p>
+                )}
+                <p role="status">
+                  {targetError ? 0 : targets.length} of {workspace.inventory.data?.total ?? 0}{' '}
+                  episodes selected
+                </p>
+              </div>
               {workspace.approvals.error && (
                 <p role="alert">Approval status is unavailable. Refresh before submitting.</p>
               )}

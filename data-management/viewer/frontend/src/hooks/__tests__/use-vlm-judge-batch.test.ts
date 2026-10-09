@@ -5,6 +5,7 @@ import {
   applyOutcomeLabel,
   outcomeToLabel,
   useJudgeDataset,
+  useJudgeSamples,
   useVlmJudgeBatch,
 } from '@/hooks/use-vlm-judge-batch'
 import { _resetCsrfToken } from '@/lib/api-client'
@@ -138,7 +139,104 @@ describe('applyOutcomeLabel', () => {
   })
 })
 
+describe('useJudgeSamples', () => {
+  it('uses the latest saved human annotation without an author choice', async () => {
+    const annotation = (annotatorId: string, timestamp: string, source = 'human') => ({
+      annotator_id: annotatorId,
+      timestamp,
+      task_completeness: { rating: 'success', confidence: 5 },
+      trajectory_quality: { overall_score: 3, metrics: {}, flags: [] },
+      data_quality: { overall_quality: 'good', issues: [] },
+      anomalies: { anomalies: [] },
+      language_instruction: {
+        instruction: `Saved by ${annotatorId}`,
+        source,
+        language: 'en',
+        paraphrases: [],
+        subtask_instructions: [],
+      },
+    })
+    mockFetch.mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/episodes/3/annotations')) {
+        const response = jsonResponse({
+          dataset_id: 'ds-1',
+          episode_index: 3,
+          annotations: [
+            annotation('older', '2026-10-01T00:00:00Z'),
+            annotation('newer', '2026-10-05T00:00:00Z'),
+            annotation('newest-template', '2026-10-08T00:00:00Z', 'template'),
+          ],
+        })
+        response.headers.set('ETag', '"saved"')
+        return response
+      }
+      if (String(url).includes('/episodes/3/judge/snapshot?annotation_author_id=newer'))
+        return jsonResponse({
+          snapshot_id: 'snapshot',
+          annotation_revision: '"saved"',
+          annotation_author_id: 'newer',
+          instruction: 'Saved by newer',
+        })
+      return jsonResponse({ detail: 'unexpected' }, 500)
+    })
+    const { result } = renderHookWithProviders(() => useJudgeSamples('ds-1', [3], true), {
+      queryClient,
+    })
+    await waitFor(() => expect(result.current.data?.[0].reference).toBeTruthy())
+    expect(result.current.data?.[0].reference).toEqual({
+      annotationAuthorId: 'newer',
+      annotationRevision: '"saved"',
+      snapshotId: 'snapshot',
+    })
+  })
+})
+
 describe('useVlmJudgeBatch', () => {
+  it('lists annotated episodes and the subset usable for grounding', async () => {
+    const saved = (index: number, source: string) => {
+      const response = jsonResponse({
+        dataset_id: 'ds-1',
+        episode_index: index,
+        annotations: [
+          {
+            annotator_id: 'person',
+            timestamp: '2026-10-01T00:00:00Z',
+            task_completeness: { rating: 'failure', confidence: 5 },
+            trajectory_quality: { overall_score: 3, metrics: {}, flags: [] },
+            data_quality: { overall_quality: 'good', issues: [] },
+            anomalies: { anomalies: [] },
+            language_instruction: {
+              instruction: 'Pick',
+              source,
+              language: 'en',
+              paraphrases: [],
+              subtask_instructions: [],
+            },
+          },
+        ],
+      })
+      response.headers.set('ETag', `"saved-${index}"`)
+      return response
+    }
+    mockFetch.mockImplementation(async (url: string) => {
+      const target = String(url)
+      if (target.includes('/datasets/ds-1/episodes?') && target.includes('has_annotations=true'))
+        return jsonResponse([
+          { index: 4, length: 1, task_index: 0, has_annotations: true },
+          { index: 3, length: 1, task_index: 0, has_annotations: true },
+        ])
+      if (target.endsWith('/episodes/3/annotations')) return saved(3, 'human')
+      if (target.endsWith('/episodes/4/annotations')) return saved(4, 'template')
+      if (target.includes('/resets?')) return jsonResponse({ detail: 'Missing' }, 404)
+      return jsonResponse({ items: [], total: 0 })
+    })
+    const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', true), {
+      queryClient,
+    })
+    await waitFor(() => expect(result.current.usable.data).toEqual([3]))
+    expect(result.current.annotated.data).toEqual([3, 4])
+  })
+
   it('reconnects to durable jobs and excludes retained evidence after access denial', async () => {
     useDatasetStore.setState({
       currentDataset: {
@@ -162,7 +260,7 @@ describe('useVlmJudgeBatch', () => {
       if (String(url).includes('/resets?')) return jsonResponse({ detail: 'Missing' }, 404)
       return jsonResponse({ items: [], total: 0 })
     })
-    const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', 0, true), {
+    const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', true), {
       queryClient,
     })
     await waitFor(() => expect(result.current.jobs.data?.items[0].id).toBe('durable'))

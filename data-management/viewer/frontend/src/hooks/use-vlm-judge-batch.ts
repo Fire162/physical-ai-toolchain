@@ -4,6 +4,7 @@ import { useEffect, useRef } from 'react'
 import { usePrincipalContext } from '@/hooks/use-principal-context'
 import {
   fetchAnnotations,
+  fetchEpisodes,
   fetchJudgeApprovals,
   fetchJudgeInventory,
   fetchJudgeJob,
@@ -18,19 +19,31 @@ import { recordDiagnosticEvent } from '@/lib/playback-diagnostics'
 import type { PrincipalContext } from '@/lib/principal-context'
 import { useDatasetStore } from '@/stores/dataset-store'
 import { useEpisodeStore } from '@/stores/episode-store'
-import type { VlmJudgeResult } from '@/types'
+import type { EpisodeAnnotation, VlmJudgeResult } from '@/types'
 import type { JudgeDatasetAction, JudgeSubmission } from '@/types/vlm-judge'
 
-export function useJudgeSamples(
-  datasetId: string,
-  indices: number[],
-  authors: Record<number, string>,
-  enabled: boolean,
-) {
+const SAMPLE_OUTCOMES = new Set(['success', 'failure', 'partial'])
+
+/** Latest saved annotation carrying the human instruction and outcome a sample needs. */
+function latestUsableAnnotation(annotations: EpisodeAnnotation[]) {
+  return annotations
+    .filter(
+      (entry) =>
+        entry.languageInstruction?.source === 'human' &&
+        !!entry.languageInstruction.instruction.trim() &&
+        SAMPLE_OUTCOMES.has(entry.taskCompleteness?.rating),
+    )
+    .reduce<EpisodeAnnotation | undefined>(
+      (latest, entry) =>
+        !latest || Date.parse(entry.timestamp) > Date.parse(latest.timestamp) ? entry : latest,
+      undefined,
+    )
+}
+
+export function useJudgeSamples(datasetId: string, indices: number[], enabled: boolean) {
   const principal = usePrincipalContext()
   const sourceId = useEpisodeStore((state) => state.currentEpisode?.sourceId)
   const sourceRevision = useEpisodeStore((state) => state.currentEpisode?.sourceRevision)
-  const selections = indices.map((index) => ({ index, author: authors[index] }))
   const query = useQuery({
     queryKey: [
       'judge-dataset',
@@ -39,30 +52,31 @@ export function useJudgeSamples(
       sourceId,
       sourceRevision,
       'samples',
-      selections,
+      indices,
     ],
     enabled: enabled && !!principal.data?.scopeId && !principal.error && indices.length > 0,
     retry: false,
     queryFn: () =>
       Promise.all(
-        selections.map(async ({ index, author }) => {
+        indices.map(async (index) => {
           const saved = await fetchAnnotations(datasetId, index)
-          const annotation = saved.data.annotations.find((entry) => entry.annotatorId === author)
-          const snapshot = annotation ? await fetchVlmJudgeSnapshot(datasetId, index, author) : null
+          const annotation = latestUsableAnnotation(saved.data.annotations)
+          const author = annotation?.annotatorId
+          const snapshot = author ? await fetchVlmJudgeSnapshot(datasetId, index, author) : null
           if (snapshot && snapshot.annotationRevision !== saved.etag)
             throw new Error('Saved sample changed. Refresh its reference.')
           return {
             index,
-            authors: saved.data.annotations.map((entry) => entry.annotatorId),
             rating: annotation?.taskCompleteness.rating,
             instruction: snapshot?.instruction,
-            reference: snapshot?.annotationRevision
-              ? {
-                  annotationAuthorId: author,
-                  annotationRevision: snapshot.annotationRevision,
-                  snapshotId: snapshot.snapshotId,
-                }
-              : null,
+            reference:
+              author && snapshot?.annotationRevision
+                ? {
+                    annotationAuthorId: author,
+                    annotationRevision: snapshot.annotationRevision,
+                    snapshotId: snapshot.snapshotId,
+                  }
+                : null,
           }
         }),
       ),
@@ -75,7 +89,6 @@ export function useJudgeSamples(
 
 export function useJudgeDataset(
   datasetId: string,
-  offset: number,
   enabled: boolean,
   reviewId?: string,
   snapshotId?: string,
@@ -96,11 +109,60 @@ export function useJudgeDataset(
       sourceId,
       sourceRevision,
       'inventory',
-      offset,
       snapshotId,
     ],
-    queryFn: () => fetchJudgeInventory(datasetId, offset, snapshotId),
+    queryFn: async () => {
+      const first = await fetchJudgeInventory(datasetId, 0, snapshotId, 250)
+      const items = [...first.items]
+      while (items.length < first.total) {
+        const page = await fetchJudgeInventory(datasetId, items.length, first.snapshotId, 250)
+        if (!page.items.length) break
+        items.push(...page.items)
+      }
+      return { ...first, items }
+    },
     enabled: ready,
+    retry: false,
+  })
+  const annotated = useQuery({
+    queryKey: ['judge-dataset', datasetId, scopeId, sourceId, sourceRevision, 'annotated'],
+    queryFn: async () => {
+      const indices: number[] = []
+      for (let offset = 0; ; offset += 1000) {
+        const page = await fetchEpisodes(datasetId, { offset, limit: 1000, hasAnnotations: true })
+        indices.push(...page.map((episode) => episode.index))
+        if (page.length < 1000) return indices.sort((first, second) => first - second)
+      }
+    },
+    enabled: ready,
+    retry: false,
+  })
+  const usable = useQuery({
+    queryKey: [
+      'judge-dataset',
+      datasetId,
+      scopeId,
+      sourceId,
+      sourceRevision,
+      'usable',
+      annotated.data,
+    ],
+    queryFn: async () => {
+      const indices = annotated.data ?? []
+      const found: number[] = []
+      for (let start = 0; start < indices.length; start += 8) {
+        const chunk = indices.slice(start, start + 8)
+        const checks = await Promise.all(
+          chunk.map(
+            async (index) =>
+              !!latestUsableAnnotation((await fetchAnnotations(datasetId, index)).data.annotations),
+          ),
+        )
+        chunk.forEach((index, position) => checks[position] && found.push(index))
+      }
+      return found
+    },
+    enabled: ready && !!annotated.data,
     retry: false,
   })
   const jobs = useQuery({
@@ -131,7 +193,7 @@ export function useJudgeDataset(
     refetchInterval: (query) =>
       ready && ['queued', 'running'].includes(query.state.data?.status ?? '') ? 3000 : false,
   })
-  const queries = [inventory, jobs, approvals, reset, review]
+  const queries = [inventory, annotated, usable, jobs, approvals, reset, review]
   const denied =
     !!principal.error ||
     queries.some(
@@ -189,6 +251,8 @@ export function useJudgeDataset(
     scopeId,
     denied,
     inventory: { ...inventory, data: denied ? undefined : inventory.data },
+    annotated: { ...annotated, data: denied ? undefined : annotated.data },
+    usable: { ...usable, data: denied ? undefined : usable.data },
     jobs: { ...jobs, data: denied ? undefined : jobs.data },
     approvals: { ...approvals, data: denied ? undefined : approvals.data },
     reset: { ...reset, data: denied ? undefined : reset.data },

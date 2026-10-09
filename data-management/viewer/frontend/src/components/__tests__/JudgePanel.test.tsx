@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { DatasetWorkspace } from '@/components/app-shell/DatasetWorkspace'
 import { JudgePanel } from '@/components/vlm-judge'
 import { ApiClientError } from '@/lib/api-client'
+import { formatEpisodeList, parseEpisodeList } from '@/lib/episode-list'
 import { useEpisodeStore } from '@/stores/episode-store'
 import type { VlmJudgeResult, VlmJudgeStatus } from '@/types'
 
@@ -60,7 +61,7 @@ vi.mock('@/hooks/use-vlm-judge-batch', async (importOriginal) => {
   return {
     ...actual,
     useVlmJudgeBatch: () => mockBatch(),
-    useJudgeDataset: () => mockDatasetJobs(),
+    useJudgeDataset: () => ({ annotated: {}, usable: {}, ...mockDatasetJobs() }),
     useJudgeSamples: () => mockSampleEvidence(),
   }
 })
@@ -136,12 +137,13 @@ describe('JudgePanel', () => {
       expect(screen.queryByRole('button', { name: 'Refresh dataset jobs' })).not.toBeInTheDocument()
       expect(
         screen.queryByRole('button', {
-          name: /evaluate samples|judge.*targets|preview.*withdrawal|preview label removal/i,
+          name: /evaluate grounding|judge.*targets|preview.*withdrawal|preview label removal/i,
         }),
       ).not.toBeInTheDocument()
       expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
       expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
-      expect(screen.queryByText('Loading episode inventory...')).not.toBeInTheDocument()
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+      expect(screen.queryByText('Loading episodes...')).not.toBeInTheDocument()
       expect(screen.queryByText('Checking saved episode readiness.')).not.toBeInTheDocument()
       expect(screen.queryByText('0 active jobs')).not.toBeInTheDocument()
       expect(screen.queryByText('private')).not.toBeInTheDocument()
@@ -166,8 +168,8 @@ describe('JudgePanel', () => {
     const { rerender } = render(
       <DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />,
     )
-    await user.click(screen.getByRole('checkbox', { name: 'Target episode 3' }))
-    expect(screen.getByRole('checkbox', { name: 'Target episode 3' })).toBeChecked()
+    await user.type(screen.getByRole('textbox', { name: 'Target episodes' }), '3')
+    expect(screen.getByRole('textbox', { name: 'Target episodes' })).toHaveValue('3')
     if (scope === 'principal') principalScope = 'principal-two'
     else
       act(() =>
@@ -183,14 +185,27 @@ describe('JudgePanel', () => {
         }),
       )
     rerender(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
-    expect(screen.getByRole('checkbox', { name: 'Target episode 3' })).not.toBeChecked()
+    expect(screen.getByRole('textbox', { name: 'Target episodes' })).toHaveValue('')
   })
-  it('reviews explicit saved human sample references before submitting a sample job', async () => {
+
+  it('parses comma-separated episode numbers and ranges', () => {
+    expect(parseEpisodeList(' 0, 2,4-6 ,2')).toEqual({ indices: [0, 2, 4, 5, 6], error: null })
+    expect(parseEpisodeList('')).toEqual({ indices: [], error: null })
+    expect(parseEpisodeList('3,x').error).toMatch(/"x" is not an episode number/)
+    expect(parseEpisodeList('8-4').error).toMatch(/low to high/)
+    expect(parseEpisodeList('1,9', new Set([1, 2])).error).toBe('Not in this dataset: 9.')
+    expect(formatEpisodeList([8, 0, 2, 4, 5, 6, 9])).toBe('0, 2, 4-6, 8, 9')
+  })
+
+  it('prefills grounding with annotated episodes and judges the remaining episodes', async () => {
     const user = userEvent.setup()
     const submit = vi.fn().mockResolvedValue({ id: 'sample-job' })
     mockBatch.mockReturnValue({ submit, isPending: false })
+    mockReadiness.mockReturnValue({ ready: true })
     mockDatasetJobs.mockReturnValue({
-      inventory: { data: { items: [3], total: 1 } },
+      inventory: { data: { items: [3, 4, 5], total: 3 } },
+      annotated: { data: [3, 5] },
+      usable: { data: [3] },
       jobs: {},
       approvals: {},
       reset: {},
@@ -204,34 +219,62 @@ describe('JudgePanel', () => {
       snapshotId: 'snapshot',
     }
     mockSampleEvidence.mockReturnValue({
+      data: [{ index: 3, reference, rating: 'success', instruction: 'Saved instruction' }],
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+    expect(screen.getByText('2 of 3 episodes annotated; 1 usable for grounding: 3')).toBeVisible()
+    expect(screen.getByText('Not usable yet: 5.')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Grounding episodes' })).toHaveAccessibleDescription(
+      /episode labels are not used/,
+    )
+    expect(screen.getByRole('textbox', { name: 'Grounding episodes' })).toHaveValue('3')
+    expect(screen.getByText('2 of 3 episodes selected')).toBeVisible()
+    expect(mockReadiness).toHaveBeenLastCalledWith('demo', [4, 5, 3], true)
+    expect(screen.getByRole('button', { name: 'Judge targets' })).toHaveAccessibleDescription(
+      /Evaluate the grounding episodes/,
+    )
+    await user.click(screen.getByRole('button', { name: 'Evaluate grounding episodes' }))
+    expect(submit).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'sample', indices: [3], samples: { 3: reference } }),
+    )
+  })
+
+  it('explains invalid grounding input and episodes without a usable saved annotation', async () => {
+    const user = userEvent.setup()
+    mockBatch.mockReturnValue({ submit: vi.fn(), isPending: false })
+    mockReadiness.mockReturnValue({ ready: true })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { data: { items: [3, 4], total: 2 } },
+      annotated: { data: [3, 4] },
+      usable: { data: [3, 4] },
+      jobs: {},
+      approvals: {},
+      reset: {},
+      review: {},
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    mockSampleEvidence.mockReturnValue({
       data: [
+        { index: 3, reference: null },
         {
-          index: 3,
-          authors: ['reviewer'],
-          reference,
-          rating: 'success',
-          instruction: 'Saved instruction',
+          index: 4,
+          reference: { annotationAuthorId: 'a', annotationRevision: 'r', snapshotId: 's' },
         },
       ],
     })
     render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
-    await user.click(screen.getByRole('checkbox', { name: 'Validation sample episode 3' }))
-    expect(screen.getByRole('button', { name: 'Evaluate samples' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Evaluate samples' })).toHaveAccessibleDescription(
-      'Choose a human reference author for every validation sample.',
+    const evaluate = screen.getByRole('button', { name: 'Evaluate grounding episodes' })
+    expect(evaluate).toBeDisabled()
+    expect(evaluate).toHaveAccessibleDescription(
+      'Episodes 3 need a saved human instruction and a success, failure or partial outcome.',
     )
-    expect(screen.getByRole('button', { name: 'Judge targets' })).toHaveAccessibleDescription(
-      'Select at least one target episode.',
-    )
-    await user.selectOptions(
-      screen.getByRole('combobox', { name: 'Episode 3 human reference author' }),
-      'reviewer',
-    )
-    expect(screen.getByText('saved-revision')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Evaluate samples' }))
-    expect(submit).toHaveBeenCalledWith(
-      expect.objectContaining({ mode: 'sample', indices: [3], samples: { 3: reference } }),
-    )
+    const input = screen.getByRole('textbox', { name: 'Grounding episodes' })
+    await user.clear(input)
+    await user.type(input, '4,7')
+    expect(input).toHaveAttribute('aria-invalid', 'true')
+    expect(input).toHaveAccessibleDescription(/Not in this dataset: 7\./)
+    expect(evaluate).toHaveAccessibleDescription('Fix the grounding episode list.')
   })
 
   it.each([
@@ -258,11 +301,11 @@ describe('JudgePanel', () => {
     })
     render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
     const description = screen
-      .getByRole('button', { name: 'Evaluate samples' })
+      .getByRole('button', { name: 'Evaluate grounding episodes' })
       .getAttribute('aria-describedby')
     const text = description ? document.getElementById(description)?.textContent : ''
     if (reason) expect(text).toMatch(reason)
-    else expect(text).toBe('Select at least one validation sample.')
+    else expect(text).toBe('Enter at least one grounding episode.')
   })
 
   it('requires acknowledgment and confirms only the displayed reset preview', async () => {
@@ -390,8 +433,8 @@ describe('JudgePanel', () => {
     })
     mockBatch.mockReturnValue({ submit: vi.fn(), isPending: false, error: null })
     render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
-    await user.click(screen.getByRole('checkbox', { name: 'Target episode 1005' }))
-    expect(mockReadiness).toHaveBeenCalledWith('demo', [1005], true)
+    await user.type(screen.getByRole('textbox', { name: 'Target episodes' }), '1005')
+    expect(mockReadiness).toHaveBeenLastCalledWith('demo', [1005], true)
     expect(screen.getByRole('button', { name: 'Judge targets' })).toBeDisabled()
     expect(screen.getByText(/1 judged.*0 applied/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Cancel job durable' }))

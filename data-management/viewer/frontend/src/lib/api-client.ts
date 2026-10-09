@@ -736,8 +736,17 @@ export function fetchJudgeEvidence(datasetId: string, episodeIndex: number) {
   )
 }
 
-export function fetchJudgeInventory(datasetId: string, offset: number, snapshotId?: string) {
-  const params = new URLSearchParams({ dataset_id: datasetId, offset: String(offset), limit: '25' })
+export function fetchJudgeInventory(
+  datasetId: string,
+  offset: number,
+  snapshotId?: string,
+  limit = 25,
+) {
+  const params = new URLSearchParams({
+    dataset_id: datasetId,
+    offset: String(offset),
+    limit: String(limit),
+  })
   if (snapshotId) params.set('snapshot_id', snapshotId)
   return apiRequest<{ items: number[]; total: number; snapshotId: string }>(
     `/judge/episodes?${params}`,
