@@ -662,6 +662,8 @@ function renderDefaultControls({
         size="sm"
         variant="outline"
         onClick={() => onSetFrameWithinPlaybackRange(playbackRangeStart)}
+        aria-label="Reset playback"
+        title="Reset playback"
       >
         <RotateCcw className="h-4 w-4" />
       </Button>

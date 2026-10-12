@@ -110,7 +110,7 @@ test('V07 joint defaults conflict retains the draft and keyboard focus with an a
 
 test('V03 and V04 episode list failure is exposed as an alert', async ({ page }, testInfo) => {
   await installApiFixture(page, { episodeList: 'error' })
-  await page.goto('/')
+  await page.goto('/?dataset=a11y-synthetic')
   await expect(page.getByRole('banner')).toBeVisible()
   const alert = page.getByRole('alert')
   await expect(alert).toContainText('The server could not complete the request')
@@ -184,7 +184,7 @@ test('J04 completes a representative local Viewer process', async ({ page }, tes
   const errors = await openViewer(page, testInfo)
   const transitions: string[] = []
 
-  const datasetButton = page.getByRole('button', { name: 'Dataset' })
+  const datasetButton = page.getByRole('button', { name: 'Dataset', exact: true })
   await datasetButton.focus()
   await datasetButton.press('Enter')
   const filter = page.getByPlaceholder('Filter datasets')

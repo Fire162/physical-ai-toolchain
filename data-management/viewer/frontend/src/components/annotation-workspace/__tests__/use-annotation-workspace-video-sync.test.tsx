@@ -5,9 +5,158 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAnnotationWorkspaceVideoSync } from '@/components/annotation-workspace/useAnnotationWorkspaceVideoSync'
 import type { FrameInsertion } from '@/types/episode-edit'
 
+function playbackOptions(
+  overrides: Partial<Parameters<typeof useAnnotationWorkspaceVideoSync>[0]> = {},
+): Parameters<typeof useAnnotationWorkspaceVideoSync>[0] {
+  return {
+    currentFrame: 0,
+    totalFrames: 10,
+    originalFrameIndex: 0,
+    activePlaybackRange: null,
+    playbackRangeStart: 0,
+    playbackRangeEnd: 9,
+    isPlaying: false,
+    playbackSpeed: 1,
+    autoPlay: false,
+    autoLoop: false,
+    shouldLoopPlaybackRange: false,
+    datasetFps: 10,
+    insertedFrames: new Map(),
+    removedFrames: new Set(),
+    videoSrc: null,
+    onSetCurrentFrame: vi.fn(),
+    onTogglePlayback: vi.fn(),
+    onSetFrameWithinPlaybackRange: vi.fn(),
+    onRecordEvent: vi.fn(),
+    ...overrides,
+  }
+}
+
 describe('useAnnotationWorkspaceVideoSync', () => {
   beforeEach(() => {
     vi.useFakeTimers()
+  })
+
+  it.each([false, true])(
+    'advances frame-only playback and %s loop behavior within selected bounds',
+    (loop) => {
+      const options = playbackOptions({
+        isPlaying: true,
+        currentFrame: 2,
+        originalFrameIndex: 2,
+        activePlaybackRange: [2, 4],
+        playbackRangeStart: 2,
+        playbackRangeEnd: 4,
+        shouldLoopPlaybackRange: loop,
+        autoLoop: loop,
+      })
+      const { rerender, unmount } = renderHook((props) => useAnnotationWorkspaceVideoSync(props), {
+        initialProps: options,
+      })
+      for (let step = 0; step < 40; step++) {
+        act(() => vi.advanceTimersByTime(20))
+        const currentFrame = vi.mocked(options.onSetCurrentFrame).mock.lastCall?.[0] ?? 2
+        rerender({ ...options, currentFrame, originalFrameIndex: currentFrame })
+      }
+      const frames = vi.mocked(options.onSetCurrentFrame).mock.calls.map(([frame]) => frame)
+      expect(frames.length).toBeGreaterThan(0)
+      expect(frames.every((frame) => frame >= 2 && frame <= 4)).toBe(true)
+      if (loop) expect(options.onTogglePlayback).not.toHaveBeenCalled()
+      else expect(options.onTogglePlayback).toHaveBeenCalledOnce()
+      unmount()
+    },
+  )
+
+  it('seeks with and without a video and resumes at the selected source window offset', () => {
+    const options = playbackOptions({ videoSrc: '/source.mp4', videoWindow: [2, 3] })
+    const { result, rerender, unmount } = renderHook(
+      (props) => useAnnotationWorkspaceVideoSync(props),
+      { initialProps: options },
+    )
+    act(() => {
+      expect(result.current.seekVideoFrame(-5, null, false)).toBe(0)
+    })
+    act(() => {
+      result.current.handleResumePlayback(0)
+      vi.advanceTimersByTime(20)
+    })
+    const video = document.createElement('video')
+    Object.defineProperty(video, 'duration', { value: 10, configurable: true })
+    Object.defineProperty(video, 'currentTime', { value: 0, configurable: true, writable: true })
+    video.pause = vi.fn()
+    video.play = vi.fn(() => Promise.resolve())
+    result.current.videoRef.current = video
+    act(() =>
+      result.current.handleLoadedMetadata({
+        currentTarget: video,
+      } as SyntheticEvent<HTMLVideoElement>),
+    )
+    act(() => {
+      expect(result.current.seekVideoFrame(9, [2, 4])).toBe(4)
+    })
+    expect(video.currentTime).toBeCloseTo(2.4)
+    rerender({ ...options, isPlaying: true, playbackSpeed: 2 })
+    act(() => {
+      result.current.handleResumePlayback(3)
+      vi.advanceTimersByTime(20)
+    })
+    expect(video.currentTime).toBeCloseTo(2.301)
+    expect(video.playbackRate).toBe(2)
+    expect(video.play).toHaveBeenCalled()
+    unmount()
+  })
+
+  it.each([false, true])(
+    'stops or loops at the end of a concatenated source window (loop=%s)',
+    (loop) => {
+      const options = playbackOptions({
+        isPlaying: true,
+        videoSrc: '/source.mp4',
+        videoWindow: [2, 3],
+        shouldLoopPlaybackRange: loop,
+        autoLoop: loop,
+      })
+      const { result, unmount } = renderHook(() => useAnnotationWorkspaceVideoSync(options))
+      const video = document.createElement('video')
+      Object.defineProperty(video, 'duration', { value: 10, configurable: true })
+      Object.defineProperty(video, 'currentTime', { value: 3, configurable: true, writable: true })
+      Object.defineProperty(video, 'paused', { value: false, configurable: true })
+      video.pause = vi.fn()
+      video.play = vi.fn(() => Promise.resolve())
+      result.current.videoRef.current = video
+      act(() => vi.advanceTimersByTime(20))
+      if (loop) {
+        expect(video.currentTime).toBeLessThan(3)
+        expect(options.onTogglePlayback).not.toHaveBeenCalled()
+      } else {
+        expect(video.pause).toHaveBeenCalledOnce()
+        expect(options.onTogglePlayback).toHaveBeenCalledOnce()
+      }
+      unmount()
+    },
+  )
+
+  it('recovers paused media while playback is active and cleans up its animation work', () => {
+    const options = playbackOptions({ isPlaying: true, videoSrc: '/source.mp4' })
+    const { result, unmount } = renderHook(() => useAnnotationWorkspaceVideoSync(options))
+    const video = document.createElement('video')
+    Object.defineProperty(video, 'currentTime', { value: 0.2, configurable: true, writable: true })
+    Object.defineProperty(video, 'duration', { value: 1, configurable: true })
+    Object.defineProperty(video, 'paused', { value: true, configurable: true })
+    video.pause = vi.fn()
+    video.play = vi.fn(() => Promise.resolve())
+    result.current.videoRef.current = video
+    act(() => vi.advanceTimersByTime(350))
+    expect(options.onRecordEvent).toHaveBeenCalledWith(
+      'playback',
+      'desync-recover',
+      expect.objectContaining({ currentFrame: 2 }),
+    )
+    expect(video.play).toHaveBeenCalled()
+    unmount()
+    vi.mocked(options.onSetCurrentFrame).mockClear()
+    act(() => vi.advanceTimersByTime(100))
+    expect(options.onSetCurrentFrame).not.toHaveBeenCalled()
   })
 
   it.each([false, true])('only requests metadata autoplay while visible (hidden=%s)', (hidden) => {

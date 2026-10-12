@@ -186,13 +186,39 @@ interface ApiFixtureOptions {
 export async function installApiFixture(page: Page, options: ApiFixtureOptions = {}) {
   const activeDatasets = options.catalog === 'empty' ? [] : datasets
   const activeEpisodes = options.catalog === 'empty' ? [] : episodes
+  const labelStates = new Map(
+    activeDatasets.map((dataset) => [
+      dataset.id,
+      {
+        revision: 0,
+        episodes: { '0': [] as string[], '1': ['REVIEWED'] } as Record<string, string[]>,
+      },
+    ]),
+  )
+  const savedEdits = new Map<string, { revision: number; operations: Record<string, unknown> }>()
+  const savedAnnotations = new Map<string, { revision: number; annotations: unknown[] }>()
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
     const path = url.pathname
     const method = request.method()
-    const json = (body: unknown, status = 200) =>
-      route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+    const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+      route.fulfill({
+        status,
+        headers,
+        contentType: 'application/json',
+        body: JSON.stringify(body),
+      })
+    const datasetId = path.split('/')[3]
+    const episodeIndex = Number(path.split('/')[5])
+    const resourceKey = `${datasetId}:${episodeIndex}`
+    const sourceId = `synthetic-source:${datasetId}`
+    const sourceRevision = 'synthetic-generation'
+    const principal = 'a11y-local-scope'
+    const matchesRevision = (revision: string | null) =>
+      revision
+        ? request.headers()['if-match'] === revision
+        : request.headers()['if-none-match'] === '*'
 
     if (path === '/api/csrf-token') return json({ csrf_token: 'synthetic-csrf' })
     if (path === '/api/auth/context') {
@@ -240,6 +266,42 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
       })
     }
     if (path === '/api/judge/results') return json({ items: [], total: 0 })
+    if (path.endsWith('/edits')) {
+      let saved = savedEdits.get(resourceKey)
+      if (method === 'PUT') {
+        const revision = saved ? `"edits-${saved.revision}"` : null
+        if (!matchesRevision(revision)) return json({ detail: 'Revision conflict' }, 412)
+        const body = request.postDataJSON() as {
+          source_id: string
+          source_revision: string
+          operations: Record<string, unknown>
+        }
+        if (body.source_id !== sourceId || body.source_revision !== sourceRevision)
+          return json({ detail: 'Source changed' }, 409)
+        saved = { revision: (saved?.revision ?? 0) + 1, operations: body.operations }
+        savedEdits.set(resourceKey, saved)
+      }
+      return json(
+        {
+          source_id: sourceId,
+          source_revision: sourceRevision,
+          author_id: principal,
+          saved: saved
+            ? {
+                schema_version: '1.0.0',
+                dataset_id: datasetId,
+                episode_index: episodeIndex,
+                source_id: sourceId,
+                source_revision: sourceRevision,
+                author_id: principal,
+                operations: saved.operations,
+              }
+            : null,
+        },
+        200,
+        saved ? { ETag: `"edits-${saved.revision}"` } : {},
+      )
+    }
     if (/\/episodes$/.test(path)) {
       if (options.episodeList === 'error') {
         return json({ code: 'SYNTHETIC_FAILURE', message: 'Synthetic episode list failure' }, 500)
@@ -247,13 +309,28 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
       return json(activeEpisodes)
     }
     if (path.endsWith('/labels')) {
-      if (method === 'PUT') return json({ episode_index: 0, labels: ['REVIEWED'] })
-      return json({
-        dataset_id: path.split('/')[3],
-        available_labels: ['REVIEWED', 'NEEDS_ATTENTION'],
-        episodes: { '0': [], '1': ['REVIEWED'] },
-        analysis: {},
-      })
+      const state = labelStates.get(datasetId)
+      if (!state) return json({ detail: 'Dataset not found' }, 404)
+      const revision = `"labels-${state.revision}"`
+      if (method === 'PUT') {
+        if (!matchesRevision(revision)) return json({ detail: 'Revision conflict' }, 412)
+        const body = request.postDataJSON() as { labels: string[] }
+        state.episodes[String(episodeIndex)] = [...body.labels]
+        state.revision++
+        return json({ episode_index: episodeIndex, labels: body.labels }, 200, {
+          ETag: `"labels-${state.revision}"`,
+        })
+      }
+      return json(
+        {
+          dataset_id: datasetId,
+          available_labels: ['REVIEWED', 'NEEDS_ATTENTION'],
+          episodes: state.episodes,
+          analysis: {},
+        },
+        200,
+        { ETag: revision },
+      )
     }
     if (path.endsWith('/joint-config') || path === '/api/joint-config/defaults') {
       if (method === 'PUT' && options.jointConfig === 'conflict') {
@@ -271,12 +348,23 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
       })
     }
     if (path.endsWith('/annotations')) {
-      return json({
-        schema_version: '1.0.0',
-        episode_index: Number(path.split('/')[5]),
-        dataset_id: path.split('/')[3],
-        annotations: [],
-      })
+      let saved = savedAnnotations.get(resourceKey)
+      if (method === 'PUT') {
+        const revision = saved ? `"annotations-${saved.revision}"` : null
+        if (!matchesRevision(revision)) return json({ detail: 'Revision conflict' }, 412)
+        saved = { revision: (saved?.revision ?? 0) + 1, annotations: [request.postDataJSON()] }
+        savedAnnotations.set(resourceKey, saved)
+      }
+      return json(
+        {
+          schema_version: '1.0.0',
+          episode_index: episodeIndex,
+          dataset_id: datasetId,
+          annotations: saved?.annotations ?? [],
+        },
+        200,
+        saved ? { ETag: `"annotations-${saved.revision}"` } : {},
+      )
     }
     if (path.endsWith('/judge')) {
       return json({
@@ -323,7 +411,12 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
       })
     }
     const episodeMatch = path.match(/\/episodes\/(\d+)$/)
-    if (episodeMatch) return json(episodePayload(Number(episodeMatch[1]), options))
+    if (episodeMatch)
+      return json({
+        ...episodePayload(Number(episodeMatch[1]), options),
+        source_id: sourceId,
+        source_revision: sourceRevision,
+      })
     if (path.endsWith('/cache/warm')) return json({ status: 'ready' })
     if (path.endsWith('/cache/stats')) {
       return json({
@@ -342,7 +435,7 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
 
 export async function attachJson(testInfo: TestInfo, name: string, value: unknown) {
   await testInfo.attach(name, {
-    body: Buffer.from(JSON.stringify(value, null, 2)),
+    body: JSON.stringify(value, null, 2),
     contentType: 'application/json',
   })
 }

@@ -41,6 +41,81 @@ function renderPlaybackCard(overrides: Record<string, unknown> = {}) {
 }
 
 describe('AnnotationWorkspacePlaybackCard', () => {
+  it('recognizes already-ready media without showing a delayed loading overlay', () => {
+    const readyState = vi.spyOn(HTMLMediaElement.prototype, 'readyState', 'get').mockReturnValue(1)
+    renderPlaybackCard({ videoSrc: '/ready.mp4', frameImageUrl: null })
+    act(() => vi.advanceTimersByTime(250))
+    expect(screen.queryByText('Loading video…')).not.toBeInTheDocument()
+    expect(document.querySelector('video')?.readyState).toBe(1)
+    readyState.mockRestore()
+  })
+
+  it('pauses the video group and requests one playback stop when the document becomes hidden', () => {
+    const onTogglePlayback = vi.fn()
+    renderPlaybackCard({ videoSrc: '/playing.mp4', isPlaying: true, onTogglePlayback })
+    const video = document.querySelector('video')!
+    video.pause = vi.fn()
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    fireEvent(document, new Event('visibilitychange'))
+    expect(video.pause).toHaveBeenCalledOnce()
+    expect(onTogglePlayback).toHaveBeenCalledOnce()
+    hidden.mockRestore()
+  })
+
+  it.each([true, false])(
+    'names and dispatches frame, reset and mode controls (compact=%s)',
+    (compact) => {
+      const onStepFrame = vi.fn()
+      const onSetFrameWithinPlaybackRange = vi.fn()
+      const onSetAutoPlay = vi.fn()
+      const onSetAutoLoop = vi.fn()
+      renderPlaybackCard({
+        compact,
+        currentFrame: 15,
+        playbackRangeStart: 10,
+        playbackRangeEnd: 20,
+        onStepFrame,
+        onSetFrameWithinPlaybackRange,
+        onSetAutoPlay,
+        onSetAutoLoop,
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Previous frame' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Next frame' }))
+      expect(onStepFrame.mock.calls).toEqual([[-1], [1]])
+      fireEvent.click(screen.getByRole('button', { name: 'Reset playback' }))
+      expect(onSetFrameWithinPlaybackRange).toHaveBeenCalledWith(10)
+      fireEvent.click(screen.getByRole('button', { name: compact ? 'Auto-play' : 'Auto' }))
+      fireEvent.click(screen.getByRole('button', { name: compact ? 'Loop playback' : 'Loop' }))
+      expect(onSetAutoPlay).toHaveBeenCalledWith(true)
+      expect(onSetAutoLoop).toHaveBeenCalledWith(true)
+      fireEvent.change(screen.getByRole('slider', { name: 'Playback frame' }), {
+        target: { value: '16' },
+      })
+      expect(onSetFrameWithinPlaybackRange).toHaveBeenLastCalledWith(16)
+    },
+  )
+
+  it('marks failed primary and follower frames unavailable and clears those states after image recovery', () => {
+    const onTogglePlayback = vi.fn()
+    renderPlaybackCard({
+      compact: true,
+      cameras: ['wrist', 'overhead'],
+      selectedCameras: ['wrist', 'overhead'],
+      frameImageUrls: { overhead: '/frames/overhead' },
+      isPlaying: true,
+      onTogglePlayback,
+    })
+    const primary = screen.getByAltText('Frame 0')
+    const follower = screen.getByAltText('overhead frame 0')
+    fireEvent.error(primary)
+    fireEvent.error(follower)
+    expect(screen.getByText('overhead: preview unavailable')).toBeVisible()
+    expect(onTogglePlayback).toHaveBeenCalledOnce()
+    fireEvent.load(primary)
+    fireEvent.load(follower)
+    expect(screen.queryByText('overhead: preview unavailable')).not.toBeInTheDocument()
+  })
+
   it('renders selected frame-only views and identifies unavailable views', () => {
     renderPlaybackCard({
       cameras: ['wrist', 'overhead', 'front'],

@@ -337,7 +337,7 @@ export function JointConfigDefaultsEditor({
   }
 
   const handleSave = () => {
-    if (hasDuplicateIndices) {
+    if (isSaving || hasDuplicateIndices) {
       return
     }
 
@@ -638,7 +638,14 @@ export function JointConfigDefaultsEditor({
             <Button variant="ghost" size="sm" onClick={handleCancel}>
               Cancel
             </Button>
-            <Button size="sm" onClick={handleSave} disabled={isSaving || hasDuplicateIndices}>
+            <Button
+              size="sm"
+              onClick={handleSave}
+              disabled={hasDuplicateIndices}
+              aria-disabled={isSaving || hasDuplicateIndices}
+              aria-busy={isSaving}
+              className="aria-disabled:opacity-50"
+            >
               {isSaving ? 'Saving…' : 'Save'}
             </Button>
           </div>

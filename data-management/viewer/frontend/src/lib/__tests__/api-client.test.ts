@@ -1,4 +1,9 @@
+import type { Page, Route } from '@playwright/test'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { installApiFixture } from '../../../e2e/accessibility-fixture'
+
+vi.mock('@playwright/test', () => ({ expect: vi.fn() }))
 
 import {
   installFetchMock,
@@ -21,10 +26,13 @@ import {
   fetchDatasets,
   fetchEpisode,
   fetchEpisodes,
+  fetchJudgeEvidence,
+  fetchJudgeInventory,
   fetchVlmJudgeStatus,
   mutateJudgeDataset,
   mutationFetch,
   mutationHeaders,
+  mutationPreconditionHeaders,
   runVlmJudge,
   saveAnnotation,
   submitJudgeJob,
@@ -50,6 +58,147 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 describe('ApiClientError', () => {
+  it('reads saved evidence and a revision-pinned inventory page without submitting inference', async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({ items: [], total: 0 }))
+      .mockResolvedValueOnce(jsonResponse({ items: [1005], total: 26, snapshot_id: 'revision' }))
+    await expect(fetchJudgeEvidence('synthetic', 1005)).resolves.toEqual({ items: [], total: 0 })
+    await expect(fetchJudgeInventory('synthetic', 25, 'revision', 250)).resolves.toMatchObject({
+      items: [1005],
+      snapshotId: 'revision',
+    })
+    expect(mockFetch.mock.calls[0][0]).toBe(
+      '/api/judge/results?dataset_id=synthetic&episode_index=1005&limit=25',
+    )
+    expect(mockFetch.mock.lastCall![0]).toContain('snapshot_id=revision')
+    expect(
+      mockFetch.mock.calls.every(([, options]) => !options.method && options.cache === 'no-store'),
+    ).toBe(true)
+  })
+
+  it('submits label-only sample references without inventing annotation ownership', async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'token' }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'sample', dataset_id: 'synthetic' }, 202))
+    await submitJudgeJob(
+      'synthetic',
+      {
+        indices: [0],
+        mode: 'sample',
+        samples: {
+          0: { snapshotId: 'saved-input', labelsRevision: 'saved-label' },
+        },
+      },
+      'request',
+    )
+    const body = JSON.parse(mockFetch.mock.lastCall![1].body as string)
+    expect(body.samples).toEqual({
+      0: { snapshot_id: 'saved-input', labels_revision: 'saved-label' },
+    })
+    expect(body.samples[0]).not.toHaveProperty('annotation_author_id')
+  })
+
+  it.each([
+    [400, 'The request is invalid'],
+    [401, 'Authentication is required'],
+    [403, 'You do not have permission to perform this action'],
+    [404, 'The requested resource was not found'],
+    [409, 'The request conflicts with the current state'],
+    [413, 'The request is too large'],
+    [422, 'The request contains invalid data'],
+    [429, 'Too many requests; try again later'],
+    [418, 'The request could not be completed'],
+  ])('reports a safe public message for status %i', async (status, message) => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: 'private details' }, status as number))
+    await expect(apiRequest('/synthetic')).rejects.toMatchObject({ message, status })
+  })
+
+  it('rejects missing and contradictory mutation preconditions', () => {
+    expect(() => mutationPreconditionHeaders({})).toThrow('A mutation precondition is required')
+    expect(() => mutationPreconditionHeaders({ etag: 'revision', createOnly: true })).toThrow(
+      'Specify only one mutation precondition',
+    )
+  })
+
+  it('uses revision-bound saved-edit and label responses in the accessibility fixture', async () => {
+    let handler: ((route: Route) => Promise<unknown>) | undefined
+    await installApiFixture({
+      route: async (_pattern: string, callback: typeof handler) => {
+        handler = callback
+      },
+    } as unknown as Page)
+    const request = async (
+      path: string,
+      method = 'GET',
+      body?: unknown,
+      headers: Record<string, string> = {},
+    ): Promise<Response> => {
+      let fulfilled: Parameters<Route['fulfill']>[0] | undefined
+      await handler!({
+        request: () => ({
+          url: () => `http://fixture${path}`,
+          method: () => method,
+          headers: () => headers,
+          postDataJSON: () => body,
+        }),
+        fulfill: async (response: Parameters<Route['fulfill']>[0]) => {
+          fulfilled = response
+        },
+      } as unknown as Route)
+      if (!fulfilled) throw new Error('Fixture did not fulfill the request')
+      return new Response(fulfilled.body as string, {
+        status: fulfilled.status,
+        headers: fulfilled.headers,
+      })
+    }
+    const base = '/api/datasets/a11y-synthetic'
+    const episode = await (await request(`${base}/episodes/0`)).json()
+    expect(episode.source_id).toBeTruthy()
+    expect(episode.source_revision).toBeTruthy()
+    const emptyEdits = await request(`${base}/episodes/0/edits`)
+    expect(emptyEdits.status).toBe(200)
+    expect(await emptyEdits.json()).toEqual({
+      source_id: episode.source_id,
+      source_revision: episode.source_revision,
+      author_id: 'a11y-local-scope',
+      saved: null,
+    })
+    const operations = { datasetId: 'a11y-synthetic', episodeIndex: 0, removedFrames: [1] }
+    const editSave = await request(
+      `${base}/episodes/0/edits`,
+      'PUT',
+      {
+        source_id: episode.source_id,
+        source_revision: episode.source_revision,
+        operations,
+      },
+      { 'if-none-match': '*' },
+    )
+    expect(editSave.headers.get('ETag')).toBeTruthy()
+    expect((await (await request(`${base}/episodes/0/edits`)).json()).saved.operations).toEqual(
+      operations,
+    )
+    expect(
+      (await request(`${base}/episodes/0/edits`, 'PUT', {}, { 'if-none-match': '*' })).status,
+    ).toBe(412)
+    const baseline = await request(`${base}/labels`)
+    const revision = baseline.headers.get('ETag')
+    expect(revision).toBeTruthy()
+    const saved = await request(
+      `${base}/episodes/0/labels`,
+      'PUT',
+      { labels: ['REVIEWED'] },
+      { 'if-match': revision! },
+    )
+    expect(saved.headers.get('ETag')).not.toBe(revision)
+    expect(await saved.json()).toEqual({ episode_index: 0, labels: ['REVIEWED'] })
+    expect((await (await request(`${base}/labels`)).json()).episodes['0']).toEqual(['REVIEWED'])
+    expect(
+      (await request(`${base}/episodes/0/labels`, 'PUT', { labels: [] }, { 'if-match': revision! }))
+        .status,
+    ).toBe(412)
+  })
+
   it('captures code, status, and details', () => {
     const err = new ApiClientError('not found', 'NOT_FOUND', 404, { id: '1' })
     expect(err.message).toBe('not found')
@@ -841,6 +990,58 @@ describe('fetchVlmJudgeStatus', () => {
 })
 
 describe('runVlmJudge', () => {
+  it.each(['partial', 'failed', 'cancelled'])(
+    'rejects a terminal %s job instead of reporting a result',
+    async (status) => {
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ csrf_token: 'token' }))
+        .mockResolvedValueOnce(jsonResponse({ id: 'job', dataset_id: 'synthetic' }, 202))
+        .mockResolvedValueOnce(jsonResponse({ id: 'job', dataset_id: 'synthetic', status }))
+      await expect(runVlmJudge('synthetic', 0)).rejects.toThrow(`Judge job ${status}.`)
+    },
+  )
+
+  it.each(['acceptance', 'poll', 'result'])(
+    'rejects changed %s identity rather than accepting another scope',
+    async (stage) => {
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ csrf_token: 'token' }))
+        .mockResolvedValueOnce(
+          jsonResponse(
+            { id: 'job', dataset_id: stage === 'acceptance' ? 'other' : 'synthetic' },
+            202,
+          ),
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            id: 'job',
+            dataset_id: stage === 'poll' ? 'other' : 'synthetic',
+            status: 'succeeded',
+            config: {},
+            targets: [{ episode_index: 0, result: { episode_id: 'other/episode_000000' } }],
+          }),
+        )
+      await expect(runVlmJudge('synthetic', 0)).rejects.toThrow(
+        stage === 'result' ? 'Judge result does not match' : 'Judge job scope changed',
+      )
+    },
+  )
+
+  it('bounds polling and reports unfinished durable work without inventing completion', async () => {
+    vi.useFakeTimers()
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'token' }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'job', dataset_id: 'synthetic' }, 202))
+      .mockImplementation(async () =>
+        jsonResponse({ id: 'job', dataset_id: 'synthetic', status: 'running' }),
+      )
+    const assertion = expect(runVlmJudge('synthetic', 0)).rejects.toThrow(
+      'Judge job is still running.',
+    )
+    await vi.advanceTimersByTimeAsync(1_800_000)
+    await assertion
+  })
+
   it('submits durable work and reads its saved result through status polling', async () => {
     mockFetch
       .mockResolvedValueOnce(jsonResponse({ csrf_token: 'csrf-1' }))

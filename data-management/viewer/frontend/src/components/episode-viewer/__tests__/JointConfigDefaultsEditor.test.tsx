@@ -91,10 +91,17 @@ describe('JointConfigDefaultsEditor', () => {
     })
   })
 
-  it('disables Save and shows saving label when isSaving is true', () => {
-    renderEditor({ isSaving: true })
+  it('keeps pending Save focusable and guarded while showing its saving state', async () => {
+    const user = userEvent.setup()
+    const { onSave } = renderEditor({ isSaving: true })
     const saveButton = screen.getByRole('button', { name: 'Saving…' })
-    expect(saveButton).toBeDisabled()
+    expect(saveButton).not.toBeDisabled()
+    expect(saveButton).toHaveAttribute('aria-disabled', 'true')
+    expect(saveButton).toHaveAttribute('aria-busy', 'true')
+    saveButton.focus()
+    await user.keyboard('{Enter}')
+    expect(saveButton).toHaveFocus()
+    expect(onSave).not.toHaveBeenCalled()
   })
 
   it('announces a failed save within the open dialog and keeps the draft available', () => {

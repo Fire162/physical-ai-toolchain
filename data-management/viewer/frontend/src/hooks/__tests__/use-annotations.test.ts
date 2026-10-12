@@ -5,6 +5,7 @@ import {
   annotationKeys,
   useAnnotationSummary,
   useAutoAnalysis,
+  useCurrentEpisodeAutoAnalysis,
   useDeleteAnnotation,
   useEpisodeAnnotations,
   useSaveAnnotation,
@@ -88,6 +89,62 @@ afterEach(() => {
 })
 
 describe('saved episode edits', () => {
+  it('keeps list and auto-analysis cache identities distinct across datasets and episodes', () => {
+    expect(annotationKeys.list('ds-1')).toEqual(['annotations', 'list', 'ds-1'])
+    expect(annotationKeys.list('ds-1')).not.toEqual(annotationKeys.list('ds-2'))
+    expect(annotationKeys.autoAnalysis('ds-1', 0)).not.toEqual(
+      annotationKeys.autoAnalysis('ds-1', 1),
+    )
+    expect(annotationKeys.autoAnalysis('ds-1', 0)).toEqual(['annotations', 'auto', 'ds-1', 0])
+  })
+
+  it('fails closed when annotation draft recovery fails without exposing storage details', async () => {
+    selectDataset()
+    const annotation = makeAnnotation('me')
+    draftMocks.load.mockRejectedValue(new Error('private storage path'))
+    mockFetch.mockResolvedValue(
+      jsonResponse(
+        { dataset_id: 'ds-1', episode_index: 0, annotations: [annotation] },
+        { headers: { ETag: 'one' } },
+      ),
+    )
+    const { result } = renderHookWithProviders(() => ({
+      read: useEpisodeAnnotations(),
+      save: useSaveAnnotation(),
+    }))
+    await waitFor(() =>
+      expect(useAnnotationStore.getState().draftError).toBe('Annotation draft recovery failed.'),
+    )
+    expect(useAnnotationStore.getState().draftHydrated).toBe(false)
+    await act(async () => {
+      await expect(
+        result.current.save.mutateAsync({ datasetId: 'ds-1', episodeIndex: 0, annotation }),
+      ).rejects.toThrow(/draft recovery/)
+    })
+    expect(mockFetch.mock.calls.every(([, options]) => options?.method !== 'PUT')).toBe(true)
+  })
+
+  it('retains local annotation changes when recovery-storage writes fail', async () => {
+    selectDataset()
+    mockFetch.mockResolvedValue(
+      jsonResponse(
+        { dataset_id: 'ds-1', episode_index: 0, annotations: [makeAnnotation('me')] },
+        { headers: { ETag: 'one' } },
+      ),
+    )
+    renderHookWithProviders(() => useEpisodeAnnotations())
+    await waitFor(() => expect(useAnnotationStore.getState().draftHydrated).toBe(true))
+    draftMocks.persist.mockRejectedValue(new Error('private storage quota'))
+    act(() => useAnnotationStore.getState().updateNotes('Unsaved annotation'))
+    await waitFor(() =>
+      expect(useAnnotationStore.getState().draftError).toBe(
+        'Annotation draft recovery storage failed.',
+      ),
+    )
+    expect(useAnnotationStore.getState().currentAnnotation?.notes).toBe('Unsaved annotation')
+    expect(useAnnotationStore.getState().isDirty).toBe(true)
+  })
+
   it('retains an annotation draft as a conflict when the source generation changes', async () => {
     selectDataset()
     useEpisodeStore.setState({
@@ -742,6 +799,24 @@ describe('useDeleteAnnotation', () => {
 })
 
 describe('useAutoAnalysis', () => {
+  it('does not analyze an absent episode and applies results only after selecting current context', async () => {
+    const { result, rerender } = renderHookWithProviders(() => useCurrentEpisodeAutoAnalysis())
+    act(() => result.current.analyze())
+    expect(mockFetch).not.toHaveBeenCalled()
+    act(() => {
+      selectDataset('ds-1', 0)
+      useAnnotationStore.getState().loadAnnotation(makeAnnotation('me'))
+    })
+    rerender()
+    mockMutationFetch(jsonResponse({ suggested_rating: 4, flags: ['jittery'] }))
+    act(() => result.current.analyze())
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(useAnnotationStore.getState().currentAnnotation?.trajectoryQuality).toMatchObject({
+      overallScore: 4,
+      flags: ['jittery'],
+    })
+  })
+
   it('applies suggested rating and flags to the annotation store on success', async () => {
     useAnnotationStore.getState().loadAnnotation(makeAnnotation('me'))
     mockMutationFetch(jsonResponse({ suggestedRating: 3, flags: ['jerky'] }))

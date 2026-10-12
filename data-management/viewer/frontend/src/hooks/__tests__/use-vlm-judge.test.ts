@@ -428,6 +428,71 @@ describe('selected episode readiness', () => {
 })
 
 describe('useApplyJudgeResult', () => {
+  it('rejects worker write failures without refreshing labels as successfully applied', async () => {
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+    queryClient.setQueryData(['auth', 'principal-context'], {
+      scopeId: 'principal-one',
+      authMode: 'local',
+    })
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    vi.mocked(mutateJudgeDataset).mockResolvedValueOnce({
+      id: 'run',
+      status: 'succeeded',
+      applicationErrors: 1,
+    } as never)
+    const { result } = renderHookWithProviders(() => useApplyJudgeResult(), { queryClient })
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ datasetId: 'ds-1', episodeIndex: 0, runId: 'run' }),
+      ).rejects.toThrow('the server could not write the label.')
+    })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['labels', 'ds-1'] })
+  })
+
+  it('rejects an application acknowledgment after the principal changes', async () => {
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+    queryClient.setQueryData(['auth', 'principal-context'], {
+      scopeId: 'principal-one',
+      authMode: 'local',
+    })
+    vi.mocked(mutateJudgeDataset).mockImplementationOnce(async () => {
+      queryClient.setQueryData(['auth', 'principal-context'], {
+        scopeId: 'principal-two',
+        authMode: 'local',
+      })
+      return { id: 'run', status: 'succeeded' } as never
+    })
+    const { result } = renderHookWithProviders(() => useApplyJudgeResult(), { queryClient })
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ datasetId: 'ds-1', episodeIndex: 0, runId: 'run' }),
+      ).rejects.toThrow('Application context changed.')
+    })
+  })
+
+  it('bounds pending application polling and leaves unfinished work visible to the operator', async () => {
+    vi.useFakeTimers()
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+    queryClient.setQueryData(['auth', 'principal-context'], {
+      scopeId: 'principal-one',
+      authMode: 'local',
+    })
+    vi.mocked(mutateJudgeDataset).mockResolvedValueOnce({ id: 'run', status: 'queued' } as never)
+    vi.mocked(fetchJudgeJob).mockResolvedValue({ id: 'run', status: 'queued' } as never)
+    const { result } = renderHookWithProviders(() => useApplyJudgeResult(), { queryClient })
+    await act(async () => {
+      const assertion = expect(
+        result.current.mutateAsync({ datasetId: 'ds-1', episodeIndex: 0, runId: 'run' }),
+      ).rejects.toThrow('the server has not applied it yet.')
+      await vi.advanceTimersByTimeAsync(65_000)
+      await assertion
+    })
+    vi.useRealTimers()
+  })
+
   it('refreshes labels only after the queued server application completes', async () => {
     const queryClient = createTestQueryClient()
     queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
