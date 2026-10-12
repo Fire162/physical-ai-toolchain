@@ -21,6 +21,30 @@ const entry = (
 
 export const viewerAccessibilityManifest: ViewerAccessibilityCase[] = [
   entry(
+    'viewer-label-persistence',
+    'P06 real backend persists labels and rejects stale writes',
+    ['episode-labels-api'],
+    ['saved', 'conflict', 'reverted'],
+    ['WCAG22-3.3.4'],
+    ['HTTP_API'],
+  ),
+  entry(
+    'viewer-label-recovery',
+    'P06 fresh browser recovers a saved label change without browser drafts',
+    ['trajectory-labels', 'save', 'workspace-save-status'],
+    ['saved', 'fresh-browser'],
+    ['WCAG22-3.3.4', 'WCAG22-4.1.2'],
+    ['HTTP_API', 'PLAYWRIGHT_TREE'],
+  ),
+  entry(
+    'viewer-workspace-disclosure',
+    'dataset workspace disclosure excludes hidden editors and returns keyboard focus without autoplay',
+    ['dataset-workspace', 'return-to-episode', 'playback'],
+    ['expanded', 'collapsed', 'unavailable'],
+    ['WCAG22-2.1.1', 'WCAG22-2.4.3', 'WCAG22-4.1.2'],
+    ['PLAYWRIGHT_KEYBOARD', 'PLAYWRIGHT_TREE'],
+  ),
+  entry(
     'viewer-joint-defaults-conflict',
     'V07 joint defaults conflict retains the draft and keyboard focus with an alert',
     ['joint-defaults-dialog'],
