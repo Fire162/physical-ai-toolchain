@@ -187,14 +187,12 @@ class TestDatasetDiscovery:
         assert service._edit_blob_synced is not None
         service.cleanup_temp_dirs()
 
-    @pytest.mark.parametrize("has_loader", [False, True])
     async def test_given_missing_local_manifest_when_no_hdf5_loader_then_source_rejected(
         self,
         tmp_path: Path,
-        has_loader: bool,
     ) -> None:
         service = DatasetService(base_path=str(tmp_path))
-        service._hdf5_handler = _make_handler(get_loader=MagicMock(return_value=has_loader))
+        service._hdf5_handler = _make_handler()
         service._hdf5_handler._get_loader.return_value = None
 
         with pytest.raises(ValueError, match="Source generation is unavailable"):

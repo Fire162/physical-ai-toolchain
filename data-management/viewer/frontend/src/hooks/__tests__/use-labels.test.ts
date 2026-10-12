@@ -177,27 +177,63 @@ describe('use-labels hooks', () => {
     },
   )
 
-  it.each([401, 403, 404])('hides saved analysis after access failure %s', async (status) => {
-    selectDataset()
-    useEpisodeStore.setState({
-      currentEpisode: {
-        sourceId: 'source',
-        sourceRevision: 'one',
-        meta: { index: 0, length: 3, taskIndex: 0, hasAnnotations: false },
-        cameras: [],
-        videoUrls: {},
-        trajectoryData: [],
-      },
-    })
-    mockFetch.mockResolvedValue(jsonResponse({ detail: 'Unavailable' }, status))
-    const { result } = renderHookWithProviders(() => useSavedEpisodeAnalysis(0))
+  it.each([401, 403, 404])(
+    'hides retained saved analysis after access failure %s',
+    async (status) => {
+      selectDataset()
+      useEpisodeStore.setState({
+        currentEpisode: {
+          sourceId: 'source',
+          sourceRevision: 'one',
+          meta: { index: 0, length: 3, taskIndex: 0, hasAnnotations: false },
+          cameras: [],
+          videoUrls: {},
+          trajectoryData: [],
+        },
+      })
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          dataset_id: 'ds-1',
+          available_labels: [],
+          episodes: {},
+          analysis: { '0': { notes: 'Saved analysis' } },
+          provenance: {
+            '0': {
+              schema_version: '1.0.0',
+              withdrawn: [],
+              acceptances: {},
+              contributions: [
+                {
+                  id: 'saved-notes',
+                  field: 'analysis/notes',
+                  origin: 'human',
+                  author_id: 'principal-one',
+                  sequence: 1,
+                },
+              ],
+            },
+          },
+        }),
+      )
+      const { result } = renderHookWithProviders(() => useSavedEpisodeAnalysis(0))
 
-    await waitFor(() => expect(result.current.isError).toBe(true))
+      await waitFor(() => expect(result.current.isSuccess).toBe(true))
+      expect(result.current.record?.notes).toBe('Saved analysis')
+      expect(result.current.ledger?.contributions).toHaveLength(1)
+      mockFetch.mockResolvedValue(jsonResponse({ detail: 'Unavailable' }, status))
 
-    expect(result.current.record).toBeUndefined()
-    expect(result.current.ledger).toBeUndefined()
-    expect(result.current.replaced).toBe(false)
-  })
+      await act(async () => {
+        await result.current.refetch()
+      })
+
+      await waitFor(() => expect(result.current.isError).toBe(true))
+
+      expect(result.current.data?.data.analysis?.[0]?.notes).toBe('Saved analysis')
+      expect(result.current.record).toBeUndefined()
+      expect(result.current.ledger).toBeUndefined()
+      expect(result.current.replaced).toBe(false)
+    },
+  )
 
   it('excludes old-source machine findings without hiding human or independent motion evidence', async () => {
     selectDataset()

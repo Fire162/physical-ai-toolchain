@@ -85,6 +85,7 @@ export function useJudgeSamples(
   return { ...query, data: denied ? undefined : query.data }
 }
 
+/** Loads principal-scoped judge state and rejects incomplete episode inventories. */
 export function useJudgeDataset(
   datasetId: string,
   enabled: boolean,
@@ -114,7 +115,9 @@ export function useJudgeDataset(
       const items = [...first.items]
       while (items.length < first.total) {
         const page = await fetchJudgeInventory(datasetId, items.length, first.snapshotId, 250)
-        if (!page.items.length) break
+        if (!page.items.length) {
+          throw new Error('Episode inventory is incomplete. Refresh before retrying.')
+        }
         items.push(...page.items)
       }
       return { ...first, items }

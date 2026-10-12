@@ -196,7 +196,7 @@ describe('useJudgeSamples', () => {
 
 describe('useVlmJudgeBatch', () => {
   it.each([false, true])(
-    'pages inventory and stops safely on an empty page: %s',
+    'pages inventory and rejects an incomplete empty page: %s',
     async (emptyPage) => {
       mockFetch.mockImplementation(async (url: string) => {
         const target = String(url)
@@ -216,9 +216,16 @@ describe('useVlmJudgeBatch', () => {
         queryClient,
       })
 
-      await waitFor(() =>
-        expect(result.current.inventory.data?.items).toEqual(emptyPage ? [0, 4] : [0, 4, 9]),
-      )
+      if (emptyPage) {
+        await waitFor(() => expect(result.current.inventory.isError).toBe(true))
+        expect(result.current.inventory.error?.message).toBe(
+          'Episode inventory is incomplete. Refresh before retrying.',
+        )
+        expect(result.current.inventory.data).toBeUndefined()
+      } else {
+        await waitFor(() => expect(result.current.inventory.isSuccess).toBe(true))
+        expect(result.current.inventory.data?.items).toEqual([0, 4, 9])
+      }
 
       expect(
         mockFetch.mock.calls.filter(([url]) => String(url).includes('/judge/episodes')),
