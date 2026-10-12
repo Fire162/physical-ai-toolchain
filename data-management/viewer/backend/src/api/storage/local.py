@@ -220,6 +220,31 @@ class LocalStorageAdapter(StorageAdapter):
         except Exception as e:
             raise StorageError(f"Failed to list annotations for {dataset_id}: {e}", cause=e)
 
+    async def list_annotation_revisions(self, dataset_id: str) -> dict[int, str | None]:
+        """List annotated episodes with a change marker from file metadata, without reading content."""
+        annotations_dir = await asyncio.to_thread(self._get_annotations_dir, dataset_id)
+
+        def scan() -> dict[int, str | None]:
+            if not annotations_dir.exists():
+                return {}
+            revisions: dict[int, str | None] = {}
+            with os.scandir(annotations_dir) as entries:
+                for entry in entries:
+                    if not (entry.name.startswith("episode_") and entry.name.endswith(".json")):
+                        continue
+                    try:
+                        index = int(entry.name[8:-5])
+                        stat = entry.stat()
+                    except (ValueError, OSError):
+                        continue
+                    revisions[index] = f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
+            return revisions
+
+        try:
+            return await asyncio.to_thread(scan)
+        except Exception as e:
+            raise StorageError(f"Failed to list annotations for {dataset_id}: {e}", cause=e)
+
     async def delete_annotation(
         self,
         dataset_id: str,

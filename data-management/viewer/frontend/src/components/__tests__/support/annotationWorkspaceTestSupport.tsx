@@ -1,6 +1,8 @@
 import { cleanup } from '@testing-library/react'
 import { vi } from 'vitest'
 
+import type { ImageTransform } from '@/types/episode-edit'
+
 const hoisted = vi.hoisted(() => {
   const diagnosticsState = {
     enabled: false,
@@ -30,7 +32,7 @@ const hoisted = vi.hoisted(() => {
     isPlaying: false,
     autoPlay: false,
     autoLoop: false,
-    cameraTransforms: {} as Record<string, { resize: { width: number; height: number } }>,
+    cameraTransforms: {} as Record<string, ImageTransform>,
     trajectoryData: [{ jointPositions: [1], timestamp: 0, gripperState: 0 }],
     subtasks: [{ id: 'subtask-1', frameRange: [2, 6] as [number, number] }],
   }

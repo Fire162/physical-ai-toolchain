@@ -102,6 +102,231 @@ function judgeResult(partial: Partial<VlmJudgeResult> = {}): VlmJudgeResult {
 }
 
 describe('JudgePanel', () => {
+  it('reviews label baselines, approves the configuration and submits both target modes', async () => {
+    const user = userEvent.setup()
+    const submit = vi.fn().mockResolvedValue({ id: 'sample' })
+    const sampleJob = {
+      id: 'sample',
+      mode: 'sample',
+      status: 'succeeded',
+      total: 1,
+      judged: 1,
+      applied: 0,
+      errors: 0,
+      config: { processMethod: 'chronological', views: ['wrist'] },
+      configRevision: 'configuration',
+      targets: [
+        {
+          episodeIndex: 0,
+          comparison: 'disagreement',
+          sample: { humanOutcome: 'success', baselineSource: 'label' },
+          result: judgeResult({ outcomeSuccess: false }),
+        },
+      ],
+    }
+    mockBatch.mockReturnValue({ submit, isPending: false })
+    mockDatasetAction.mockResolvedValue({ id: 'approval', configRevision: 'configuration' })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { data: { items: [0, 1, 2], total: 3, snapshotId: 'inventory' } },
+      annotated: { data: [0] },
+      usable: { data: [0] },
+      jobs: { data: { items: [sampleJob], total: 1 } },
+      approvals: {
+        data: {
+          items: [
+            { id: 'approval', current: true, sampleJobId: 'sample' },
+            { id: 'old', current: false },
+          ],
+        },
+      },
+      reset: {},
+      review: { data: sampleJob },
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    const reference = { snapshotId: 'snapshot', labelsRevision: 'label-revision' }
+    mockSampleEvidence.mockReturnValue({ data: [{ index: 0, reference }] })
+    act(() =>
+      useEpisodeStore.setState({
+        currentEpisode: {
+          meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+          cameras: ['top', 'wrist'],
+          videoUrls: {},
+          trajectoryData: [],
+        },
+      }),
+    )
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Process method' }),
+      'chronological',
+    )
+    await user.click(screen.getByRole('checkbox', { name: 'top' }))
+    expect(screen.getByRole('checkbox', { name: 'wrist' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Evaluate grounding episodes' }))
+    expect(submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        mode: 'sample',
+        indices: [0],
+        samples: { 0: reference },
+        options: { processMethod: 'chronological', views: ['wrist'] },
+      }),
+    )
+    expect(screen.getByText(/saved label success; judge false/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Approve configuration' })).toBeDisabled()
+    await user.click(
+      screen.getByRole('checkbox', { name: 'I reviewed disagreements and inconclusive results' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Approve configuration' }))
+    expect(mockDatasetAction).toHaveBeenLastCalledWith({
+      kind: 'approve',
+      jobId: 'sample',
+      acknowledgeExceptions: true,
+    })
+    await user.click(screen.getByRole('button', { name: 'Judge targets' }))
+    expect(submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ mode: 'judge', indices: [1, 2], approvalId: 'approval' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Judge and label targets' }))
+    expect(submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ mode: 'judge-and-label', indices: [1, 2] }),
+    )
+    expect(screen.getByRole('option', { name: 'old (stale)' })).toBeDisabled()
+    await user.type(screen.getByRole('textbox', { name: 'Target episodes' }), '9')
+    expect(screen.getByRole('button', { name: 'Judge targets' })).toBeDisabled()
+    expect(screen.getByText('Not in this dataset: 9.')).toBeVisible()
+    await user.clear(screen.getByRole('textbox', { name: 'Target episodes' }))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Configuration approval' }), '')
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Configuration approval' }),
+      'approval',
+    )
+    expect(screen.getByRole('button', { name: 'Judge targets' })).toBeEnabled()
+  })
+
+  it('reviews durable sample and target jobs, retries failures, pages history and refreshes', async () => {
+    const user = userEvent.setup()
+    const refresh = vi.fn()
+    mockDatasetAction.mockResolvedValue({})
+    mockBatch.mockReturnValue({ submit: vi.fn(), isPending: false })
+    mockDatasetJobs.mockReturnValue({
+      inventory: {},
+      approvals: {},
+      reset: {},
+      review: {},
+      jobs: {
+        error: new Error('refresh failed'),
+        data: {
+          total: 30,
+          items: [
+            { id: 'sample', mode: 'sample', status: 'succeeded', config: {}, total: 1 },
+            { id: 'failed', mode: 'judge', status: 'failed', config: {}, total: 1 },
+          ],
+        },
+      },
+      act: mockDatasetAction,
+      refresh,
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+    expect(screen.getByText(/Previously loaded jobs remain visible/)).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Review samples' }))
+    await user.click(screen.getByRole('button', { name: 'Job details' }))
+    await user.click(screen.getByRole('button', { name: 'Retry job failed' }))
+    expect(mockDatasetAction).toHaveBeenLastCalledWith({ kind: 'retry', jobId: 'failed' })
+    await user.click(screen.getByRole('button', { name: 'Next jobs' }))
+    expect(screen.getByRole('button', { name: 'Previous jobs' })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: 'Previous jobs' }))
+    expect(screen.getByRole('button', { name: 'Previous jobs' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Refresh dataset jobs' }))
+    expect(refresh).toHaveBeenCalledOnce()
+  })
+
+  it('reports unavailable saved baselines and approvals and retries a partial label removal', async () => {
+    const user = userEvent.setup()
+    mockDatasetAction.mockResolvedValue({})
+    mockBatch.mockReturnValue({
+      submit: vi.fn(),
+      isPending: false,
+      error: new Error('private request'),
+    })
+    mockSampleEvidence.mockReturnValue({ error: new Error('private annotation') })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { error: new Error('private inventory') },
+      annotated: { error: new Error('private annotation') },
+      usable: {},
+      approvals: { error: new Error('private approval') },
+      jobs: {},
+      review: {},
+      reset: { data: { status: 'partial' } },
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+    expect(screen.getByText('Episode inventory could not be loaded.')).toBeVisible()
+    expect(screen.getByText('Annotated episodes could not be loaded.')).toBeVisible()
+    expect(
+      screen.getByText('Approval status is unavailable. Refresh before submitting.'),
+    ).toBeVisible()
+    expect(
+      screen.getByText('Saved annotations could not be loaded. Refresh before evaluating.'),
+    ).toBeVisible()
+    expect(screen.queryByText(/private/)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Retry label removal' }))
+    expect(mockDatasetAction).toHaveBeenLastCalledWith({ kind: 'retry-reset' })
+  })
+
+  it('retries retained judge evidence and selects a scoring method without rerunning automatically', async () => {
+    const user = userEvent.setup()
+    const refetch = vi.fn()
+    mockUseStatus.mockReturnValue({ data: status({ result: judgeResult() }), isLoading: false })
+    mockEvidence.mockReturnValue({
+      error: new Error('private error'),
+      data: {
+        items: [
+          {
+            resultKind: 'judge',
+            runId: 'saved',
+            resultId: 'result',
+            applicability: 'current',
+            applied: true,
+            input: { snapshotId: 'snapshot' },
+            result: judgeResult(),
+          },
+          {
+            resultKind: 'task-findings',
+            runId: 'task',
+            resultId: 'task-result',
+            applicability: 'current',
+            input: { snapshotId: 'snapshot' },
+            result: {
+              judgeModel: 'echo',
+              findings: {
+                object: 'cube',
+                pickFrom: 'table',
+                graspSuccess: true,
+                placeSuccess: false,
+                movementQuality: 'steady',
+                notes: 'saved',
+              },
+            },
+          },
+        ],
+      },
+      refetch,
+    })
+    render(<JudgePanel datasetId="demo" episodeIndex={0} />)
+    await user.click(screen.getByRole('button', { name: 'Retry evidence' }))
+    expect(refetch).toHaveBeenCalledOnce()
+    expect(mockMutate).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('combobox'))
+    await user.click(screen.getByRole('option', { name: 'Chronological' }))
+    await user.click(screen.getByRole('button', { name: /re-evaluate/i }))
+    expect(mockMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ options: { processMethod: 'chronological', force: false } }),
+    )
+    expect(screen.getByText('cube')).toBeInTheDocument()
+  })
+
   it.each(['disabled', 'checking-access', 'access-error', 'denied'])(
     'hides batch controls while %s and keeps the return action available',
     async (state) => {
@@ -222,10 +447,14 @@ describe('JudgePanel', () => {
       data: [{ index: 3, reference, rating: 'success', instruction: 'Saved instruction' }],
     })
     render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
-    expect(screen.getByText('2 of 3 episodes annotated; 1 usable for grounding: 3')).toBeVisible()
+    expect(
+      screen.getByText(
+        '2 of 3 episodes with saved labels or annotations; 1 usable for grounding: 3',
+      ),
+    ).toBeVisible()
     expect(screen.getByText('Not usable yet: 5.')).toBeVisible()
     expect(screen.getByRole('textbox', { name: 'Grounding episodes' })).toHaveAccessibleDescription(
-      /episode labels are not used/,
+      /Instruction source is unrestricted/,
     )
     expect(screen.getByRole('textbox', { name: 'Grounding episodes' })).toHaveValue('3')
     expect(screen.getByText('2 of 3 episodes selected')).toBeVisible()
@@ -267,7 +496,7 @@ describe('JudgePanel', () => {
     const evaluate = screen.getByRole('button', { name: 'Evaluate grounding episodes' })
     expect(evaluate).toBeDisabled()
     expect(evaluate).toHaveAccessibleDescription(
-      'Episodes 3 need a saved human instruction and a success, failure or partial outcome.',
+      'Episodes 3 need a saved task instruction and one SUCCESS, FAILURE or PARTIAL label, or a saved task-completeness rating.',
     )
     const input = screen.getByRole('textbox', { name: 'Grounding episodes' })
     await user.clear(input)
@@ -722,6 +951,10 @@ describe('JudgePanel', () => {
   it.each([
     [new ApiClientError('invalid', 'HTTP_422', 422), /rejected .* as invalid.*will not resolve/i],
     [new ApiClientError('conflict', 'HTTP_409', 409), /conflicts with newer saved inputs/i],
+    [new ApiClientError('denied', 'HTTP_403', 403), /not authorized/],
+    [new ApiClientError('absent', 'HTTP_404', 404), /run was not found/],
+    [new ApiClientError('server', 'HTTP_500', 500), /failed on the server/],
+    [new Error('local failure'), /Label application failed: local failure/],
   ])('distinguishes application failure %#', (error, message) => {
     applicationError = error
     mockUseStatus.mockReturnValue({

@@ -549,6 +549,7 @@ export function useSaveEpisodeLabels() {
       }
       if (context.datasetId) {
         queryClient.invalidateQueries({ queryKey: labelKeys.dataset(context.datasetId) })
+        queryClient.invalidateQueries({ queryKey: ['judge-dataset', context.datasetId] })
       }
     },
     onError: (error, variables, context) => {

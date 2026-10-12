@@ -7,10 +7,12 @@ for annotation summaries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
 
+from evaluation.vlm_judge.saved_input import grounding_author
 from pydantic import JsonValue
 
 from ..models.annotations import (
@@ -19,6 +21,8 @@ from ..models.annotations import (
     ComputedQualityMetrics,
     EpisodeAnnotation,
     EpisodeAnnotationFile,
+    GroundingEpisode,
+    GroundingOverview,
     TrajectoryFlag,
 )
 from ..models.contributions import ContributionLedger, MachineOrigin
@@ -28,6 +32,9 @@ from ..storage import LocalStorageAdapter, RevisionConflictError, StorageAdapter
 from ..storage.paths import edit_resource_scope
 
 logger = logging.getLogger(__name__)
+
+_GROUNDING_CACHE_LIMIT = 200_000
+_GROUNDING_READ_CONCURRENCY = 16
 
 
 def _annotation_fields(value: JsonValue, prefix: str = "") -> dict[str, JsonValue]:
@@ -72,6 +79,50 @@ class AnnotationService:
             self._storage = storage_adapter
         else:
             self._storage = LocalStorageAdapter(base_path)
+        # (dataset, episode) -> (listing revision, grounding author); revalidated on every overview
+        self._grounding_cache: OrderedDict[tuple[str, int], tuple[str, str | None]] = OrderedDict()
+
+    async def get_grounding_overview(self, dataset_id: str) -> GroundingOverview:
+        """List annotated episodes and those whose latest saved human annotation can ground the judge."""
+        revisions = await self._storage.list_annotation_revisions(dataset_id)
+        authors: dict[int, str | None] = {}
+        stale: list[int] = []
+        for index, revision in revisions.items():
+            cached = self._grounding_cache.get((dataset_id, index))
+            if revision is not None and cached is not None and cached[0] == revision:
+                self._grounding_cache.move_to_end((dataset_id, index))
+                authors[index] = cached[1]
+            else:
+                stale.append(index)
+        limit = asyncio.Semaphore(_GROUNDING_READ_CONCURRENCY)
+
+        async def check(index: int) -> None:
+            async with limit:
+                annotation = await self._storage.get_annotation(dataset_id, index)
+            author = grounding_author(annotation.model_dump(mode="json") if annotation else None)
+            authors[index] = author
+            if revisions[index] is not None:
+                self._grounding_cache[(dataset_id, index)] = (revisions[index], author)
+                self._grounding_cache.move_to_end((dataset_id, index))
+
+        await asyncio.gather(*(check(index) for index in stale))
+        while len(self._grounding_cache) > _GROUNDING_CACHE_LIMIT:
+            self._grounding_cache.popitem(last=False)
+        logger.debug(
+            "Grounding overview dataset=%s annotated=%d reread=%d",
+            dataset_id.replace("\r", "").replace("\n", ""),
+            len(revisions),
+            len(stale),
+        )
+        return GroundingOverview(
+            dataset_id=dataset_id,
+            annotated=sorted(revisions),
+            usable=[
+                GroundingEpisode(episode_index=index, annotator_id=author)
+                for index, author in sorted(authors.items())
+                if author is not None
+            ],
+        )
 
     async def get_annotation(self, dataset_id: str, episode_idx: int) -> EpisodeAnnotationFile | None:
         """

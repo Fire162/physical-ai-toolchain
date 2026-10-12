@@ -20,6 +20,22 @@ describe('AnnotationWorkspace playback and trajectory tab flows', () => {
   beforeEach(setupAnnotationWorkspaceTestCase)
   afterEach(teardownAnnotationWorkspaceTestCase)
 
+  it.each([
+    [{ crop: { x: 0, y: 0, width: 32, height: 32 } }, true],
+    [{ colorFilter: 'grayscale' }, true],
+    [{ colorAdjustment: { brightness: 0.2 } }, true],
+    [{ colorAdjustment: { gamma: 1, brightness: 0 } }, false],
+    [{ colorFilter: 'none' }, false],
+  ] as const)(
+    'identifies whether camera transform %# requires an unavailable edited preview',
+    (transform, unavailable) => {
+      testState.cameraTransforms = { main: transform }
+      render(<AnnotationWorkspace />)
+      if (unavailable) expect(screen.getByText(/edited preview unavailable/i)).toBeVisible()
+      else expect(screen.queryByText(/edited preview unavailable/i)).not.toBeInTheDocument()
+    },
+  )
+
   it('identifies a selected camera transform that the source preview cannot render', () => {
     testState.cameraTransforms = { main: { resize: { width: 128, height: 128 } } }
     render(<AnnotationWorkspace />)

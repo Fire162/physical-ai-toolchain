@@ -3,8 +3,7 @@ import { useEffect, useRef } from 'react'
 
 import { usePrincipalContext } from '@/hooks/use-principal-context'
 import {
-  fetchAnnotations,
-  fetchEpisodes,
+  fetchGroundingOverview,
   fetchJudgeApprovals,
   fetchJudgeInventory,
   fetchJudgeJob,
@@ -19,31 +18,25 @@ import { recordDiagnosticEvent } from '@/lib/playback-diagnostics'
 import type { PrincipalContext } from '@/lib/principal-context'
 import { useDatasetStore } from '@/stores/dataset-store'
 import { useEpisodeStore } from '@/stores/episode-store'
-import type { EpisodeAnnotation, VlmJudgeResult } from '@/types'
+import type { VlmJudgeResult } from '@/types'
 import type { JudgeDatasetAction, JudgeSubmission } from '@/types/vlm-judge'
 
-const SAMPLE_OUTCOMES = new Set(['success', 'failure', 'partial'])
-
-/** Latest saved annotation carrying the human instruction and outcome a sample needs. */
-function latestUsableAnnotation(annotations: EpisodeAnnotation[]) {
-  return annotations
-    .filter(
-      (entry) =>
-        entry.languageInstruction?.source === 'human' &&
-        !!entry.languageInstruction.instruction.trim() &&
-        SAMPLE_OUTCOMES.has(entry.taskCompleteness?.rating),
-    )
-    .reduce<EpisodeAnnotation | undefined>(
-      (latest, entry) =>
-        !latest || Date.parse(entry.timestamp) > Date.parse(latest.timestamp) ? entry : latest,
-      undefined,
-    )
-}
-
-export function useJudgeSamples(datasetId: string, indices: number[], enabled: boolean) {
+/** Bind each baseline to the backend-selected annotation or saved labels and task snapshot. */
+export function useJudgeSamples(
+  datasetId: string,
+  indices: number[],
+  authors: Record<number, string | null>,
+  enabled: boolean,
+  labelRevisions: Record<number, string> = {},
+) {
   const principal = usePrincipalContext()
   const sourceId = useEpisodeStore((state) => state.currentEpisode?.sourceId)
   const sourceRevision = useEpisodeStore((state) => state.currentEpisode?.sourceRevision)
+  const selections = indices.map((index) => ({
+    index,
+    author: authors[index],
+    labelsRevision: labelRevisions[index],
+  }))
   const query = useQuery({
     queryKey: [
       'judge-dataset',
@@ -52,31 +45,36 @@ export function useJudgeSamples(datasetId: string, indices: number[], enabled: b
       sourceId,
       sourceRevision,
       'samples',
-      indices,
+      selections,
     ],
     enabled: enabled && !!principal.data?.scopeId && !principal.error && indices.length > 0,
     retry: false,
     queryFn: () =>
       Promise.all(
-        indices.map(async (index) => {
-          const saved = await fetchAnnotations(datasetId, index)
-          const annotation = latestUsableAnnotation(saved.data.annotations)
-          const author = annotation?.annotatorId
-          const snapshot = author ? await fetchVlmJudgeSnapshot(datasetId, index, author) : null
-          if (snapshot && snapshot.annotationRevision !== saved.etag)
-            throw new Error('Saved sample changed. Refresh its reference.')
+        selections.map(async ({ index, author, labelsRevision }) => {
+          const snapshot =
+            author || labelsRevision
+              ? await fetchVlmJudgeSnapshot(datasetId, index, author ?? undefined)
+              : null
+          const annotationReference =
+            snapshot?.annotationAuthorId && snapshot.annotationRevision
+              ? {
+                  annotationAuthorId: snapshot.annotationAuthorId,
+                  annotationRevision: snapshot.annotationRevision,
+                }
+              : {}
           return {
             index,
-            rating: annotation?.taskCompleteness.rating,
-            instruction: snapshot?.instruction,
             reference:
-              author && snapshot?.annotationRevision
+              labelsRevision && snapshot?.instruction.trim()
                 ? {
-                    annotationAuthorId: author,
-                    annotationRevision: snapshot.annotationRevision,
+                    ...annotationReference,
+                    labelsRevision,
                     snapshotId: snapshot.snapshotId,
                   }
-                : null,
+                : author && snapshot?.annotationRevision && snapshot.annotationAuthorId === author
+                  ? { ...annotationReference, snapshotId: snapshot.snapshotId }
+                  : null,
           }
         }),
       ),
@@ -124,47 +122,25 @@ export function useJudgeDataset(
     enabled: ready,
     retry: false,
   })
-  const annotated = useQuery({
-    queryKey: ['judge-dataset', datasetId, scopeId, sourceId, sourceRevision, 'annotated'],
-    queryFn: async () => {
-      const indices: number[] = []
-      for (let offset = 0; ; offset += 1000) {
-        const page = await fetchEpisodes(datasetId, { offset, limit: 1000, hasAnnotations: true })
-        indices.push(...page.map((episode) => episode.index))
-        if (page.length < 1000) return indices.sort((first, second) => first - second)
-      }
-    },
+  const grounding = useQuery({
+    queryKey: ['judge-dataset', datasetId, scopeId, sourceId, sourceRevision, 'grounding'],
+    queryFn: () => fetchGroundingOverview(datasetId),
     enabled: ready,
     retry: false,
   })
-  const usable = useQuery({
-    queryKey: [
-      'judge-dataset',
-      datasetId,
-      scopeId,
-      sourceId,
-      sourceRevision,
-      'usable',
-      annotated.data,
-    ],
-    queryFn: async () => {
-      const indices = annotated.data ?? []
-      const found: number[] = []
-      for (let start = 0; start < indices.length; start += 8) {
-        const chunk = indices.slice(start, start + 8)
-        const checks = await Promise.all(
-          chunk.map(
-            async (index) =>
-              !!latestUsableAnnotation((await fetchAnnotations(datasetId, index)).data.annotations),
-          ),
-        )
-        chunk.forEach((index, position) => checks[position] && found.push(index))
-      }
-      return found
-    },
-    enabled: ready && !!annotated.data,
-    retry: false,
-  })
+  const annotated = { ...grounding, data: grounding.data?.annotated }
+  const usable = {
+    ...grounding,
+    data: grounding.data && (grounding.data.usable ?? []).map((episode) => episode.episodeIndex),
+  }
+  const groundingAuthors = Object.fromEntries(
+    (grounding.data?.usable ?? []).map((episode) => [episode.episodeIndex, episode.annotatorId]),
+  ) as Record<number, string | null>
+  const groundingLabelRevisions = Object.fromEntries(
+    (grounding.data?.usable ?? [])
+      .filter((episode) => episode.labelsRevision)
+      .map((episode) => [episode.episodeIndex, episode.labelsRevision]),
+  ) as Record<number, string>
   const jobs = useQuery({
     queryKey: ['judge-dataset', datasetId, scopeId, sourceId, sourceRevision, 'jobs', jobOffset],
     queryFn: () => fetchJudgeJobs(datasetId, jobOffset),
@@ -193,7 +169,7 @@ export function useJudgeDataset(
     refetchInterval: (query) =>
       ready && ['queued', 'running'].includes(query.state.data?.status ?? '') ? 3000 : false,
   })
-  const queries = [inventory, annotated, usable, jobs, approvals, reset, review]
+  const queries = [inventory, grounding, jobs, approvals, reset, review]
   const denied =
     !!principal.error ||
     queries.some(
@@ -253,6 +229,8 @@ export function useJudgeDataset(
     inventory: { ...inventory, data: denied ? undefined : inventory.data },
     annotated: { ...annotated, data: denied ? undefined : annotated.data },
     usable: { ...usable, data: denied ? undefined : usable.data },
+    groundingAuthors: denied ? {} : groundingAuthors,
+    groundingLabelRevisions: denied ? {} : groundingLabelRevisions,
     jobs: { ...jobs, data: denied ? undefined : jobs.data },
     approvals: { ...approvals, data: denied ? undefined : approvals.data },
     reset: { ...reset, data: denied ? undefined : reset.data },

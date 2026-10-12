@@ -31,8 +31,13 @@ from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from starlette.requests import Request
-from starlette.responses import Response
+
+try:
+    from starlette.requests import Request
+    from starlette.responses import Response
+except ModuleNotFoundError as error:
+    if error.name != "starlette":
+        raise
 
 from evaluation.vlm_judge.curation_storage import CurationStorage, LocalCurationStorage, apply_judge_result
 
@@ -46,7 +51,6 @@ from .service import (
     ServiceConfig,
     ServiceExecutor,
 )
-from .swagger_ui import install_responsive_swagger_ui
 
 _LOGGER = logging.getLogger("evaluation.vlm_judge")
 
@@ -91,14 +95,15 @@ class JobOptions(BaseModel):
 
 class SampleReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    annotation_author_id: str = Field(min_length=1, max_length=256)
-    annotation_revision: str = Field(min_length=1, max_length=200)
+    annotation_author_id: str | None = Field(default=None, min_length=1, max_length=256)
+    annotation_revision: str | None = Field(default=None, min_length=1, max_length=200)
+    labels_revision: str | None = Field(default=None, min_length=1, max_length=128)
     snapshot_id: str = Field(min_length=1, max_length=128)
 
     @field_validator("*")
     @classmethod
-    def clean_reference(cls, value: str) -> str:
-        return value.replace("\r", "").replace("\n", "")
+    def clean_reference(cls, value: str | None) -> str | None:
+        return value.replace("\r", "").replace("\n", "") if value is not None else None
 
 
 class ApprovalRequest(BaseModel):
@@ -202,10 +207,15 @@ def build_job_router(
         dataset_id: str = Query(min_length=1, max_length=255),
         actor: str = Depends(actor_dependency),
         jobs: JudgeJobs = jobs_dependency,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         dataset_id = dataset_id.replace("\r", "").replace("\n", "")
         await invoke(jobs.resolver.episode_indices(dataset_id, principal_scope_id=actor))
-        result = await invoke(jobs.reset_status(dataset_id, actor))
+        try:
+            result = await invoke(jobs.reset_status(dataset_id, actor))
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            return None
         return {key: value for key, value in result.items() if key != "actor"}
 
     @router.post("/resets/retry", status_code=202, dependencies=mutation_dependencies or [])
@@ -238,7 +248,9 @@ def build_job_router(
                 expected_snapshots=payload.snapshot_ids,
                 mode=payload.mode,
                 approval_id=payload.approval_id,
-                samples={int(index): reference.model_dump() for index, reference in payload.samples.items()},
+                samples={
+                    int(index): reference.model_dump(exclude_none=True) for index, reference in payload.samples.items()
+                },
                 require_approval=True,
             )
         )
@@ -553,6 +565,8 @@ def build_app():
     """
     from fastapi import FastAPI
 
+    from .swagger_ui import install_responsive_swagger_ui
+
     backend = BackendConfig(
         kind=os.environ.get("VLM_JUDGE_BACKEND", "echo"),
         model_id=os.environ.get("VLM_JUDGE_MODEL_ID", "Qwen/Qwen3-VL-4B-Instruct"),
@@ -589,4 +603,9 @@ def build_app():
     return app
 
 
-app = build_app()
+try:
+    app = build_app()
+except ModuleNotFoundError as error:
+    if error.name not in {"fastapi", "starlette"}:
+        raise
+    app = None

@@ -381,6 +381,7 @@ export function useSaveAnnotation() {
       queryClient.invalidateQueries({
         queryKey: annotationKeys.summary(variables.datasetId),
       })
+      queryClient.invalidateQueries({ queryKey: ['judge-dataset', variables.datasetId] })
     },
 
     onError: (error, variables, context) => {

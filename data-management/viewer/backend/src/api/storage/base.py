@@ -79,6 +79,10 @@ class StorageAdapter(ABC):
         """
         pass
 
+    async def list_annotation_revisions(self, dataset_id: str) -> dict[int, str | None]:
+        """List annotated episodes with a cheap change marker; None means content must be reread."""
+        return dict.fromkeys(await self.list_annotated_episodes(dataset_id))
+
     @abstractmethod
     async def delete_annotation(
         self,

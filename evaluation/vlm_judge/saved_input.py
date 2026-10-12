@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
+    from .curation import DatasetLabelsFile
     from .dataset import EpisodeRecord
 
 
@@ -170,22 +172,93 @@ def local_source_revision(root: Path, metadata_paths: list[Path] | None = None) 
     )
 
 
+SAMPLE_OUTCOMES = frozenset({"success", "failure", "partial"})
+
+
+def label_baseline(labels: DatasetLabelsFile, episode_index: int) -> dict[str, str] | None:
+    """Resolve one saved outcome label with an episode-scoped revision, regardless of its origin."""
+    key = str(episode_index)
+    outcomes = {label.lower() for label in labels.episodes.get(key, []) if label.lower() in SAMPLE_OUTCOMES}
+    if len(outcomes) != 1:
+        return None
+    ledger = labels.provenance.get(key)
+    content = {
+        "dataset_id": labels.dataset_id,
+        "episode_index": episode_index,
+        "outcomes": sorted(outcomes),
+        "contributions": [
+            entry.model_dump(mode="json")
+            for entry in (ledger.contributions if ledger else [])
+            if entry.field.lower() in {f"labels/{outcome}" for outcome in SAMPLE_OUTCOMES}
+        ],
+    }
+    return {
+        "outcome": next(iter(outcomes)),
+        "revision": hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def grounding_issue(value: dict[str, Any], annotation: dict[str, Any]) -> str | None:
+    """Explain why one saved annotation cannot ground judge calibration, or return None."""
+    instruction = annotation.get("language_instruction") or {}
+    text = instruction.get("instruction")
+    outcome = (annotation.get("task_completeness") or {}).get("rating")
+    if not isinstance(text, str) or not text.strip() or outcome not in SAMPLE_OUTCOMES:
+        return "Samples require a saved instruction and known baseline outcome"
+    return None
+
+
+def _saved_at(annotation: dict[str, Any]) -> datetime:
+    try:
+        saved = datetime.fromisoformat(str(annotation.get("timestamp")))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    return saved if saved.tzinfo else saved.replace(tzinfo=UTC)
+
+
+def grounding_author(value: dict[str, Any] | None) -> str | None:
+    """Return the author of the latest saved annotation with an instruction and known outcome."""
+    usable = [
+        annotation
+        for annotation in (value or {}).get("annotations", [])
+        if grounding_issue(value or {}, annotation) is None
+    ]
+    return max(usable, key=_saved_at)["annotator_id"] if usable else None
+
+
 async def resolve_validation_sample(
     reader: SavedInputReader,
     snapshot: SavedInputSnapshot,
     reference: dict[str, str],
+    *,
+    labels: DatasetLabelsFile | None = None,
 ) -> dict[str, Any]:
-    from .curation import ContributionLedger
-
+    annotation_keys = {"annotation_author_id", "annotation_revision"}
+    label_sample = "labels_revision" in reference
+    required = {"snapshot_id", "labels_revision"} if label_sample else {"snapshot_id", *annotation_keys}
     if (
-        set(reference) != {"annotation_author_id", "annotation_revision", "snapshot_id"}
+        not required.issubset(reference)
+        or set(reference) - required - annotation_keys
+        or (bool(annotation_keys & reference.keys()) and not annotation_keys.issubset(reference))
         or any(not isinstance(value, str) or not value.strip() for value in reference.values())
-        or snapshot.annotation_author_id != reference["annotation_author_id"]
-        or snapshot.annotation_revision != reference["annotation_revision"]
+        or ("annotation_author_id" in reference and snapshot.annotation_author_id != reference["annotation_author_id"])
+        or ("annotation_revision" in reference and snapshot.annotation_revision != reference["annotation_revision"])
         or snapshot.snapshot_id != reference["snapshot_id"]
-        or snapshot.instruction_origin != "annotation"
+        or not snapshot.instruction.strip()
     ):
-        raise SavedInputError("Select explicit saved human instruction and outcome revisions")
+        raise SavedInputError("Select current saved instruction and baseline revisions")
+    if label_sample:
+        baseline = label_baseline(labels, snapshot.episode_index) if labels else None
+        if labels is None or labels.dataset_id != snapshot.dataset_id or baseline is None:
+            raise SavedInputError("Select exactly one saved success, failure or partial label")
+        if baseline["revision"] != reference["labels_revision"]:
+            raise SavedInputError("Validation label revision changed")
+        return {
+            "reference": dict(reference),
+            "input": snapshot.model_dump(mode="json"),
+            "human_outcome": baseline["outcome"],
+            "baseline_source": "label",
+        }
     resource = await reader.annotation(snapshot.dataset_id, snapshot.episode_index)
     value = resource.value or {}
     if (
@@ -198,26 +271,14 @@ async def resolve_validation_sample(
         entry for entry in value.get("annotations", []) if entry.get("annotator_id") == snapshot.annotation_author_id
     ]
     if len(selected) != 1:
-        raise SavedInputError("Select one saved human annotation for each sample")
+        raise SavedInputError("Select one saved annotation for each sample")
     annotation = selected[0]
-    instruction = annotation.get("language_instruction") or {}
-    outcome = (annotation.get("task_completeness") or {}).get("rating")
-    if (
-        instruction.get("source") != "human"
-        or instruction.get("instruction") != snapshot.instruction
-        or outcome not in {"success", "failure", "partial"}
-    ):
-        raise SavedInputError("Samples require a saved human instruction and known human outcome")
-    ledger = ContributionLedger.model_validate(value.get("provenance", {}).get(snapshot.annotation_author_id, {}))
-    for field, expected in (
-        ("language_instruction/instruction", snapshot.instruction),
-        ("task_completeness/rating", outcome),
-    ):
-        resolved = ledger.resolve(field, human_author_id=snapshot.annotation_author_id)
-        if resolved.origin != "human" or resolved.value != expected:
-            raise SavedInputError(
-                "Sample instruction and outcome require human authorship, not acceptance or legacy ownership"
-            )
+    if (annotation.get("language_instruction") or {}).get("instruction") != snapshot.instruction:
+        raise SavedInputError("Samples require a saved instruction and known baseline outcome")
+    issue = grounding_issue(value, annotation)
+    if issue:
+        raise SavedInputError(issue)
+    outcome = annotation["task_completeness"]["rating"]
     if (await reader.annotation(snapshot.dataset_id, snapshot.episode_index)).etag != resource.etag:
         raise SavedInputError("Validation sample revision changed")
     return {"reference": dict(reference), "input": snapshot.model_dump(mode="json"), "human_outcome": outcome}
@@ -294,7 +355,12 @@ class LocalDatasetResolver:
             annotation_author_id=reference.get("annotation_author_id"),
             expected_snapshot_id=reference.get("snapshot_id"),
         )
-        return await resolve_validation_sample(LocalSavedInputReader(self.datasets[dataset_id]), snapshot, reference)
+        from .curation_storage import LocalCurationStorage
+
+        labels = await LocalCurationStorage(self.datasets).load_versioned(dataset_id)
+        return await resolve_validation_sample(
+            LocalSavedInputReader(self.datasets[dataset_id]), snapshot, reference, labels=labels.value
+        )
 
     async def episode_indices(self, dataset_id: str, *, principal_scope_id: str) -> list[int]:
         from .dataset import iter_episodes

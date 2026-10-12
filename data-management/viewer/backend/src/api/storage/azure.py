@@ -297,6 +297,32 @@ class AzureBlobStorageAdapter(StorageAdapter):
         except Exception as e:
             raise StorageError(f"Failed to list annotations for {dataset_id}: {e}", cause=e)
 
+    async def list_annotation_revisions(self, dataset_id: str) -> dict[int, str | None]:
+        """List annotated episodes with their blob ETags from one paged listing."""
+        prefix = f"{dataset_id_to_blob_prefix(dataset_id)}/annotations/episodes/episode_"
+        try:
+            client = await self._get_client()
+            container_client = client.get_container_client(self.container_name)
+            revisions: dict[int, str | None] = {}
+            async for blob in container_client.list_blobs(name_starts_with=prefix):
+                if not blob.name.endswith(".json"):
+                    continue
+                try:
+                    index = int(blob.name.split("/")[-1][8:-5])
+                except ValueError:
+                    continue
+                etag = getattr(blob, "etag", None)
+                revisions[index] = str(etag) if etag else None
+            return revisions
+        except HttpResponseError as e:
+            raise StorageError(
+                f"Azure HTTP error listing annotations for {dataset_id}: "
+                f"status={e.status_code} error_code={e.error_code}",
+                cause=e,
+            )
+        except Exception as e:
+            raise StorageError(f"Failed to list annotations for {dataset_id}: {e}", cause=e)
+
     async def delete_annotation(
         self,
         dataset_id: str,

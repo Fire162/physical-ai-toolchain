@@ -1,4 +1,8 @@
-# VLM-as-Judge
+---
+title: VLM-as-Judge
+description: Run reproducible vision-language episode evaluations with saved inputs and approval-gated dataset jobs
+ms.date: 2026-10-12
+---
 
 Open-weight-first harness that scores LeRobot manipulation episodes and
 policy-rollout videos with a vision-language model. Dataset and rollout CLIs
@@ -241,10 +245,18 @@ service = JudgeService(
 )
 resolver = LocalDatasetResolver({"example-dataset": Path("/data/example-dataset")})
 app.include_router(
-  build_router(service, resolver=resolver, local_actor="local-operator"),
-  prefix="/api/vlm-judge",
+    build_router(service, resolver=resolver, local_actor="local-operator"),
+    prefix="/api/vlm-judge",
 )
 ```
+
+Core request models and router factories remain importable without the optional HTTP dependencies.
+Install the API extra in the owning environment before constructing or serving the ASGI app.
+Dataset grounding accepts saved instructions of any source, including templates and dataset tasks,
+with one saved outcome label or a saved task-completeness rating. Applied labels are comparison
+baselines, not independent human validation. Review sample results and explicitly approve the
+configuration before dataset execution; changes to grounding inputs invalidate that approval.
+Reading reset history before any withdrawal returns `200` with `null`, not a missing-route error.
 
 The example explicitly enables an unauthenticated local actor. Bind local-only
 services to loopback. Authenticated applications supply `principal_dependency`;

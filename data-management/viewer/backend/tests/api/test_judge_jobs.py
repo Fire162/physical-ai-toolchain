@@ -1243,18 +1243,34 @@ def test_given_http_dataset_work_when_submitting_then_explicit_approval_is_requi
         assert client.get("/approvals", params={"dataset_id": "dataset"}).json()["items"][0]["current"] is True
 
 
+def test_given_no_withdrawal_history_when_reading_reset_status_then_successful_empty_state(tmp_path: Path) -> None:
+    from evaluation.vlm_judge.api import build_job_router
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    jobs = manager(tmp_path)
+    app = FastAPI()
+    app.include_router(build_job_router(lambda: jobs, actor_dependency=lambda: "actor", prepare_config=dict))
+    with TestClient(app) as client:
+        response = client.get("/resets", params={"dataset_id": "dataset"})
+
+    assert response.status_code == 200
+    assert response.json() is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "origin,rating,source,accepted",
     [
         ("human", "success", "human", True),
         ("human", "partial", "human", True),
-        ("legacy-unknown", "success", "human", False),
+        ("legacy-unknown", "success", "human", True),
         ("human", "unknown", "human", False),
-        ("human", "success", "llm-generated", False),
+        ("human", "success", "llm-generated", True),
+        ("template", "success", "template", True),
     ],
 )
-async def test_given_saved_sample_when_resolving_then_human_provenance_and_revision_are_required(
+async def test_given_saved_sample_when_resolving_then_saved_outcome_and_revision_are_required(
     tmp_path: Path,
     origin: str,
     rating: str,
@@ -1306,6 +1322,132 @@ async def test_given_saved_sample_when_resolving_then_human_provenance_and_revis
     else:
         with pytest.raises(SavedInputError):
             await resolve_validation_sample(reader, snapshot, reference)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels,accepted",
+    [
+        (["SUCCESS"], True),
+        (["FAILURE"], True),
+        (["PARTIAL"], True),
+        (["SUCCESS", "FAILURE"], False),
+        (["CUSTOM"], False),
+    ],
+)
+async def test_given_saved_labels_when_grounding_then_one_outcome_and_current_revision_are_required(
+    tmp_path: Path,
+    labels: list[str],
+    accepted: bool,
+) -> None:
+    from evaluation.vlm_judge.curation import DatasetLabelsFile
+    from evaluation.vlm_judge.saved_input import (
+        LocalSavedInputReader,
+        SavedInputError,
+        label_baseline,
+        resolve_validation_sample,
+    )
+
+    saved = DatasetLabelsFile(dataset_id="dataset", episodes={"3": labels})
+    baseline = label_baseline(saved, 3)
+    if not accepted:
+        assert baseline is None
+        return
+    assert baseline is not None
+    _, snapshot = await Resolver().resolve("dataset", 3, principal_scope_id="actor")
+    snapshot = snapshot.model_copy(
+        update={"annotation_author_id": None, "annotation_revision": None, "instruction_origin": "dataset"}
+    )
+    reference = {"snapshot_id": snapshot.snapshot_id, "labels_revision": baseline["revision"]}
+    reader = LocalSavedInputReader(tmp_path)
+
+    result = await resolve_validation_sample(reader, snapshot, reference, labels=saved)
+
+    assert result["human_outcome"] == labels[0].lower()
+    assert result["baseline_source"] == "label"
+    changed = saved.model_copy(deep=True)
+    changed.episodes["3"] = ["PARTIAL" if labels != ["PARTIAL"] else "SUCCESS"]
+    with pytest.raises(SavedInputError, match="revision"):
+        await resolve_validation_sample(reader, snapshot, reference, labels=changed)
+
+
+@pytest.mark.asyncio
+async def test_given_label_baseline_when_approved_then_only_grounding_label_changes_invalidate_it(
+    tmp_path: Path,
+) -> None:
+    from evaluation.vlm_judge.curation import DatasetLabelsFile, MachineOrigin
+    from evaluation.vlm_judge.curation_storage import LocalCurationStorage
+    from evaluation.vlm_judge.saved_input import (
+        LocalSavedInputReader,
+        SavedInputError,
+        label_baseline,
+        resolve_validation_sample,
+    )
+
+    storage = LocalCurationStorage({"dataset": tmp_path / "dataset"})
+    labels = DatasetLabelsFile(dataset_id="dataset")
+    labels.apply_labels(
+        3,
+        ["FAILURE"],
+        author_id="actor",
+        machine_origin=MachineOrigin(
+            run_id="prior",
+            result_id="prior-result",
+            run_order=1,
+            source_revision="revision",
+            input_revision="snapshot-3",
+            config_revision="config",
+        ),
+    )
+    await storage.save("dataset", labels, if_none_match=True)
+    jobs = manager(tmp_path / "jobs")
+
+    async def sample(
+        dataset_id: str,
+        episode_index: int,
+        *,
+        principal_scope_id: str,
+        reference: dict[str, str],
+        views: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        _, snapshot = await jobs.resolver.resolve(dataset_id, episode_index, principal_scope_id=principal_scope_id)
+        saved = await storage.load_versioned(dataset_id)
+        return await resolve_validation_sample(
+            LocalSavedInputReader(tmp_path / "dataset"), snapshot, reference, labels=saved.value
+        )
+
+    jobs.resolver.validation_sample = sample
+    reference = {"snapshot_id": "snapshot-3", "labels_revision": label_baseline(labels, 3)["revision"]}
+    accepted = await jobs.submit(
+        "dataset", "actor", [3], {}, mode="sample", samples={3: reference}, idempotency_key="labels"
+    )
+    await jobs.run_once()
+    completed = await jobs.get(accepted["id"], "actor")
+    assert completed["targets"][0]["sample"]["baseline_source"] == "label"
+    assert completed["targets"][0]["comparison"] == "agreement"
+    approval = await jobs.approve(accepted["id"], "actor")
+    resource = await storage.load_versioned("dataset")
+    labels = resource.value
+    labels.apply_labels(1005, ["SUCCESS"], author_id="actor")
+    await storage.save("dataset", labels, if_match=resource.etag)
+    await jobs.submit(
+        "dataset", "actor", [1005], {}, approval_id=approval["id"], require_approval=True, idempotency_key="targets"
+    )
+    resource = await storage.load_versioned("dataset")
+    labels = resource.value
+    labels.apply_labels(3, ["SUCCESS"], author_id="actor")
+    await storage.save("dataset", labels, if_match=resource.etag)
+
+    with pytest.raises(SavedInputError, match="revision"):
+        await jobs.submit(
+            "dataset",
+            "actor",
+            [1005],
+            {},
+            approval_id=approval["id"],
+            require_approval=True,
+            idempotency_key="stale-label",
+        )
 
 
 @pytest.mark.asyncio

@@ -107,7 +107,7 @@ function DatasetWorkspaceContent({
     [inventoryItems],
   )
   const annotated = workspace.annotated.data
-  const usable = workspace.usable.data ?? (workspace.usable.error ? annotated : undefined)
+  const usable = workspace.usable.data
   const notUsable = usable ? (annotated ?? []).filter((index) => !usable.includes(index)) : []
   const groundingValue = groundingText ?? formatEpisodeList((usable ?? []).slice(0, MAX_GROUNDING))
   const grounding = parseEpisodeList(groundingValue, known)
@@ -127,7 +127,13 @@ function DatasetWorkspaceContent({
     [...new Set([...targets, ...sampleIndices])],
     open && enabled,
   )
-  const samples = useJudgeSamples(datasetId, groundingError ? [] : sampleIndices, open && enabled)
+  const samples = useJudgeSamples(
+    datasetId,
+    groundingError ? [] : sampleIndices,
+    workspace.groundingAuthors ?? {},
+    open && enabled,
+    workspace.groundingLabelRevisions ?? {},
+  )
   const jobs = workspace.jobs.data?.items ?? []
   const busy = batch.isPending || workspace.isPending
   const canMutate = enabled && !workspace.denied
@@ -214,7 +220,7 @@ function DatasetWorkspaceContent({
           : samples.isFetching
             ? 'Loading saved human annotations.'
             : unusable.length
-              ? `Episodes ${formatEpisodeList(unusable)} need a saved human instruction and a success, failure or partial outcome.`
+              ? `Episodes ${formatEpisodeList(unusable)} need a saved task instruction and one SUCCESS, FAILURE or PARTIAL label, or a saved task-completeness rating.`
               : null,
   )
   const targetBlockReason = blockReason(
@@ -310,13 +316,11 @@ function DatasetWorkspaceContent({
             <section aria-label="Grounding episodes" className="space-y-3">
               <h3 className="font-semibold">Grounding episodes</h3>
               <p className="text-muted-foreground text-sm">
-                Hand-annotated episodes are used to check the judge before the batch runs. Each
-                episode uses its latest saved annotation. Evaluate them, review the results and
-                approve the configuration, then judge the target episodes.
+                Saved outcome labels and task instructions are used as baselines. Instructions from
+                templates and dataset tasks are accepted without changing their source. Label
+                baselines may include AI-applied labels and are not independent human validation.
               </p>
-              {(workspace.annotated.isPending ||
-                workspace.inventory.isPending ||
-                (annotated && workspace.usable.isPending)) && (
+              {(workspace.annotated.isPending || workspace.inventory.isPending) && (
                 <p role="status">Loading annotated episodes...</p>
               )}
               {workspace.inventory.error && (
@@ -325,16 +329,11 @@ function DatasetWorkspaceContent({
               {workspace.annotated.error && (
                 <p role="alert">Annotated episodes could not be loaded.</p>
               )}
-              {workspace.usable.error && (
-                <p role="alert">
-                  Saved annotations could not be checked. All annotated episodes are listed.
-                </p>
-              )}
               {annotated && usable && (
                 <div className="space-y-1 text-sm break-words">
                   <p>
-                    {annotated.length} of {workspace.inventory.data?.total ?? '?'} episodes
-                    annotated; {usable.length} usable for grounding
+                    {annotated.length} of {workspace.inventory.data?.total ?? '?'} episodes with
+                    saved labels or annotations; {usable.length} usable for grounding
                     {usable.length ? `: ${formatEpisodeList(usable)}` : '.'}
                   </p>
                   {notUsable.length > 0 && <p>Not usable yet: {formatEpisodeList(notUsable)}.</p>}
@@ -358,8 +357,9 @@ function DatasetWorkspaceContent({
                 />
                 <p id="grounding-hint" className="text-muted-foreground">
                   Comma-separated episode numbers or ranges, up to {MAX_GROUNDING} episodes. A
-                  grounding episode needs a saved success, failure or partial rating and a
-                  human-written task instruction; episode labels are not used.
+                  grounding episode needs a saved task instruction and one SUCCESS, FAILURE or
+                  PARTIAL label, or a saved task-completeness rating. Instruction source is
+                  unrestricted.
                 </p>
                 {groundingError && (
                   <p id="grounding-error" className="text-destructive">
@@ -391,7 +391,8 @@ function DatasetWorkspaceContent({
                   <ul>
                     {review.targets?.map((target) => (
                       <li key={target.episodeIndex}>
-                        Episode {target.episodeIndex}: {target.comparison ?? target.status}; human{' '}
+                        Episode {target.episodeIndex}: {target.comparison ?? target.status};{' '}
+                        {target.sample?.baselineSource === 'label' ? 'saved label' : 'saved rating'}{' '}
                         {String(target.sample?.humanOutcome ?? 'unknown')}; judge{' '}
                         {String(target.result?.outcomeSuccess ?? 'inconclusive')}
                         {target.error && `; error: ${target.error}`}
@@ -448,6 +449,7 @@ function DatasetWorkspaceContent({
                 Configuration approval
                 <select
                   value={approvalId}
+                  disabled={!workspace.approvals.data?.items.length}
                   onChange={(event) => {
                     setApprovalId(event.target.value)
                     const approval = workspace.approvals.data?.items.find(
@@ -457,7 +459,11 @@ function DatasetWorkspaceContent({
                   }}
                   className="max-w-full rounded border p-2"
                 >
-                  <option value="">Select approval</option>
+                  <option value="">
+                    {workspace.approvals.data?.items.length
+                      ? 'Select approval'
+                      : 'No approved configuration yet'}
+                  </option>
                   {(workspace.approvals.data?.items ?? []).map((approval) => (
                     <option key={approval.id} value={approval.id} disabled={!approval.current}>
                       {approval.id}

@@ -77,7 +77,10 @@ export interface JudgeJob {
     error: string | null
     applied: boolean
     comparison?: 'agreement' | 'disagreement' | 'inconclusive'
-    sample?: { humanOutcome: 'success' | 'failure' | 'partial' }
+    sample?: {
+      humanOutcome: 'success' | 'failure' | 'partial'
+      baselineSource?: 'label'
+    }
   }>
 }
 
@@ -160,8 +163,9 @@ export type JudgeEvidence = JudgeEvidenceIdentity &
   )
 
 export interface JudgeSampleReference {
-  annotationAuthorId: string
-  annotationRevision: string
+  annotationAuthorId?: string
+  annotationRevision?: string
+  labelsRevision?: string
   snapshotId: string
 }
 

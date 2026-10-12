@@ -196,14 +196,14 @@ def test_given_invalid_result_when_decoded_then_rejected(field: str, value: obje
 
     payload = {**_judge_payload(), field: value}
 
-    with pytest.raises(ValueError, match="result|Result|milestone"):
+    with pytest.raises(ValueError, match=r"result|Result|milestone"):
         _result_from_dict(payload)
 
 
 def test_given_missing_result_when_decoded_then_validation_error() -> None:
     from evaluation.vlm_judge.service import _result_from_dict
 
-    with pytest.raises(ValueError, match="result|Result"):
+    with pytest.raises(ValueError, match=r"result|Result"):
         _result_from_dict({})
 
 

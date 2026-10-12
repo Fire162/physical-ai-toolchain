@@ -631,3 +631,97 @@ def test_get_annotation_summary_returns_payload(client: TestClient, override_ser
     assert body["total_episodes"] == 42
     assert body["annotated_episodes"] == 10
     annotation_service.get_summary.assert_awaited_once_with("ds-1", 42)
+
+
+def test_get_grounding_overview_returns_annotated_and_usable(client: TestClient, override_services) -> None:
+    from src.api.models.annotations import GroundingEpisode, GroundingOverview
+
+    dataset_service, annotation_service = override_services
+    dataset_service.get_dataset.return_value = _make_dataset(total_episodes=42)
+    annotation_service.get_grounding_overview = AsyncMock(
+        return_value=GroundingOverview(
+            dataset_id="ds-1",
+            annotated=[1, 4],
+            usable=[GroundingEpisode(episode_index=4, annotator_id="alice")],
+        )
+    )
+
+    response = client.get("/api/datasets/ds-1/annotations/grounding")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dataset_id": "ds-1",
+        "annotated": [1, 4],
+        "usable": [{"episode_index": 4, "annotator_id": "alice", "labels_revision": None}],
+    }
+
+
+def test_given_saved_labels_and_dataset_task_when_grounding_then_no_annotation_is_required(
+    client: TestClient,
+    override_services,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evaluation.vlm_judge.curation import DatasetLabelsFile
+    from evaluation.vlm_judge.dataset import EpisodeRecord
+    from evaluation.vlm_judge.saved_input import label_baseline
+
+    from src.api.models.annotations import GroundingOverview
+    from src.api.routers import labels as label_router
+
+    saved = DatasetLabelsFile(dataset_id="ds-1", episodes={"0": ["SUCCESS"], "1": ["FAILURE", "PARTIAL"]})
+    path = tmp_path / "ds-1" / "meta" / "episode_labels.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(saved.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(label_router, "_label_storage", None)
+    dataset_service, annotation_service = override_services
+    dataset_service.get_dataset.return_value = _make_dataset()
+    dataset_service.get_episode_media_record = AsyncMock(
+        return_value=EpisodeRecord(
+            episode_id="ds-1/episode_000000",
+            episode_index=0,
+            instruction="Transfer the cube",
+            fps=30,
+            length=10,
+            video_paths={},
+            from_timestamp=None,
+            to_timestamp=None,
+        )
+    )
+    annotation_service.get_grounding_overview = AsyncMock(return_value=GroundingOverview(dataset_id="ds-1"))
+
+    response = client.get("/api/datasets/ds-1/annotations/grounding")
+
+    assert response.status_code == 200
+    assert response.json()["usable"] == [
+        {
+            "episode_index": 0,
+            "annotator_id": None,
+            "labels_revision": label_baseline(saved, 0)["revision"],
+        }
+    ]
+
+
+def test_get_grounding_overview_hides_storage_failure_details(
+    client: TestClient, override_services, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.api.storage import StorageError
+
+    dataset_service, annotation_service = override_services
+    dataset_service.get_dataset.return_value = _make_dataset(total_episodes=42)
+    annotation_service.get_grounding_overview = AsyncMock(side_effect=StorageError("https://account/blob?sig=secret"))
+
+    response = client.get("/api/datasets/ds-1/annotations/grounding")
+
+    assert response.status_code == 503
+    assert "secret" not in response.text
+    assert "secret" not in caplog.text
+    assert "Grounding overview failed" in caplog.text
+
+
+def test_get_grounding_overview_dataset_not_found_returns_404(client: TestClient, override_services) -> None:
+    dataset_service, _ = override_services
+    dataset_service.get_dataset.return_value = None
+
+    assert client.get("/api/datasets/ds-1/annotations/grounding").status_code == 404

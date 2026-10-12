@@ -10,6 +10,7 @@ from evaluation.vlm_judge.saved_input import (
     SavedInputError,
     SavedInputSnapshot,
     SavedResource,
+    label_baseline,
     resolve_validation_sample,
 )
 from evaluation.vlm_judge.saved_input import resolve_saved_input as resolve_snapshot
@@ -63,9 +64,18 @@ class ViewerDatasetResolver:
             annotation_author_id=reference.get("annotation_author_id"),
             expected_snapshot_id=reference.get("snapshot_id"),
         )
-        return await resolve_validation_sample(
-            ViewerSavedInputReader(self.datasets, self.annotations), snapshot, reference
+        from ..routers.labels import _get_label_storage
+
+        storage = _get_label_storage()
+        labels = await storage.load(dataset_id) if "labels_revision" in reference else None
+        sample = await resolve_validation_sample(
+            ViewerSavedInputReader(self.datasets, self.annotations), snapshot, reference, labels=labels
         )
+        if labels is not None:
+            current = await storage.load(dataset_id)
+            if label_baseline(current, episode_index) != label_baseline(labels, episode_index):
+                raise SavedInputError("Validation label revision changed")
+        return sample
 
     async def episode_indices(self, dataset_id: str, *, principal_scope_id: str) -> list[int]:
         if await self.datasets.get_dataset(dataset_id) is None:

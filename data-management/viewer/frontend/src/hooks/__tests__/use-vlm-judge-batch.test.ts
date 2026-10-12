@@ -140,36 +140,31 @@ describe('applyOutcomeLabel', () => {
 })
 
 describe('useJudgeSamples', () => {
-  it('uses the latest saved human annotation without an author choice', async () => {
-    const annotation = (annotatorId: string, timestamp: string, source = 'human') => ({
-      annotator_id: annotatorId,
-      timestamp,
-      task_completeness: { rating: 'success', confidence: 5 },
-      trajectory_quality: { overall_score: 3, metrics: {}, flags: [] },
-      data_quality: { overall_quality: 'good', issues: [] },
-      anomalies: { anomalies: [] },
-      language_instruction: {
-        instruction: `Saved by ${annotatorId}`,
-        source,
-        language: 'en',
-        paraphrases: [],
-        subtask_instructions: [],
-      },
-    })
+  it('binds a saved label baseline to the dataset task without requiring an annotation', async () => {
     mockFetch.mockImplementation(async (url: string) => {
-      if (String(url).endsWith('/episodes/3/annotations')) {
-        const response = jsonResponse({
-          dataset_id: 'ds-1',
-          episode_index: 3,
-          annotations: [
-            annotation('older', '2026-10-01T00:00:00Z'),
-            annotation('newer', '2026-10-05T00:00:00Z'),
-            annotation('newest-template', '2026-10-08T00:00:00Z', 'template'),
-          ],
+      if (String(url).endsWith('/episodes/3/judge/snapshot'))
+        return jsonResponse({
+          snapshot_id: 'task-snapshot',
+          annotation_revision: null,
+          annotation_author_id: null,
+          instruction: 'Transfer the cube',
+          instruction_origin: 'dataset',
         })
-        response.headers.set('ETag', '"saved"')
-        return response
-      }
+      return jsonResponse({ detail: 'unexpected' }, 500)
+    })
+    const { result } = renderHookWithProviders(
+      () => useJudgeSamples('ds-1', [3], { 3: null }, true, { 3: 'label-revision' }),
+      { queryClient },
+    )
+    await waitFor(() =>
+      expect(result.current.data).toEqual([
+        { index: 3, reference: { snapshotId: 'task-snapshot', labelsRevision: 'label-revision' } },
+      ]),
+    )
+  })
+
+  it('binds each grounding episode to the backend-selected saved annotation', async () => {
+    mockFetch.mockImplementation(async (url: string) => {
       if (String(url).includes('/episodes/3/judge/snapshot?annotation_author_id=newer'))
         return jsonResponse({
           snapshot_id: 'snapshot',
@@ -179,62 +174,52 @@ describe('useJudgeSamples', () => {
         })
       return jsonResponse({ detail: 'unexpected' }, 500)
     })
-    const { result } = renderHookWithProviders(() => useJudgeSamples('ds-1', [3], true), {
-      queryClient,
-    })
-    await waitFor(() => expect(result.current.data?.[0].reference).toBeTruthy())
-    expect(result.current.data?.[0].reference).toEqual({
-      annotationAuthorId: 'newer',
-      annotationRevision: '"saved"',
-      snapshotId: 'snapshot',
-    })
+    const { result } = renderHookWithProviders(
+      () => useJudgeSamples('ds-1', [3, 4], { 3: 'newer' }, true),
+      { queryClient },
+    )
+    await waitFor(() => expect(result.current.data).toHaveLength(2))
+    expect(result.current.data).toEqual([
+      {
+        index: 3,
+        reference: {
+          annotationAuthorId: 'newer',
+          annotationRevision: '"saved"',
+          snapshotId: 'snapshot',
+        },
+      },
+      { index: 4, reference: null },
+    ])
+    expect(mockFetch.mock.calls.some(([url]) => String(url).includes('/annotations'))).toBe(false)
   })
 })
 
 describe('useVlmJudgeBatch', () => {
-  it('lists annotated episodes and the subset usable for grounding', async () => {
-    const saved = (index: number, source: string) => {
-      const response = jsonResponse({
-        dataset_id: 'ds-1',
-        episode_index: index,
-        annotations: [
-          {
-            annotator_id: 'person',
-            timestamp: '2026-10-01T00:00:00Z',
-            task_completeness: { rating: 'failure', confidence: 5 },
-            trajectory_quality: { overall_score: 3, metrics: {}, flags: [] },
-            data_quality: { overall_quality: 'good', issues: [] },
-            anomalies: { anomalies: [] },
-            language_instruction: {
-              instruction: 'Pick',
-              source,
-              language: 'en',
-              paraphrases: [],
-              subtask_instructions: [],
-            },
-          },
-        ],
-      })
-      response.headers.set('ETag', `"saved-${index}"`)
-      return response
-    }
+  it('loads annotated and usable grounding episodes in one request', async () => {
     mockFetch.mockImplementation(async (url: string) => {
       const target = String(url)
-      if (target.includes('/datasets/ds-1/episodes?') && target.includes('has_annotations=true'))
-        return jsonResponse([
-          { index: 4, length: 1, task_index: 0, has_annotations: true },
-          { index: 3, length: 1, task_index: 0, has_annotations: true },
-        ])
-      if (target.endsWith('/episodes/3/annotations')) return saved(3, 'human')
-      if (target.endsWith('/episodes/4/annotations')) return saved(4, 'template')
+      if (target.endsWith('/datasets/ds-1/annotations/grounding'))
+        return jsonResponse({
+          dataset_id: 'ds-1',
+          annotated: [3, 4],
+          usable: [
+            { episode_index: 3, annotator_id: 'person' },
+            { episode_index: 4, annotator_id: null, labels_revision: 'label-revision' },
+          ],
+        })
       if (target.includes('/resets?')) return jsonResponse({ detail: 'Missing' }, 404)
       return jsonResponse({ items: [], total: 0 })
     })
     const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', true), {
       queryClient,
     })
-    await waitFor(() => expect(result.current.usable.data).toEqual([3]))
+    await waitFor(() => expect(result.current.usable.data).toEqual([3, 4]))
     expect(result.current.annotated.data).toEqual([3, 4])
+    expect(result.current.groundingAuthors).toEqual({ 3: 'person', 4: null })
+    expect(result.current.groundingLabelRevisions).toEqual({ 4: 'label-revision' })
+    expect(
+      mockFetch.mock.calls.some(([url]) => /episodes\/\d+\/annotations/.test(String(url))),
+    ).toBe(false)
   })
 
   it('reconnects to durable jobs and excludes retained evidence after access denial', async () => {

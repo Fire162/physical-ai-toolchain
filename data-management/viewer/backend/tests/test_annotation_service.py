@@ -464,6 +464,62 @@ class TestSaveAndGet:
         assert await service.get_annotation("ds", 99) is None
 
 
+class TestGroundingOverview:
+    @staticmethod
+    def _grounded(annotator_id: str, saved_at: str, source: str = "human") -> EpisodeAnnotation:
+        from src.api.models.annotations import LanguageInstructionAnnotation
+
+        annotation = _build_annotation(annotator_id)
+        annotation.timestamp = datetime.fromisoformat(saved_at)
+        annotation.language_instruction = LanguageInstructionAnnotation(
+            instruction=f"Saved by {annotator_id}", source=source
+        )
+        return annotation
+
+    async def test_given_saved_annotations_when_listed_then_latest_saved_author_grounds_each_episode(
+        self, service: AnnotationService
+    ) -> None:
+        first = await service.save_annotation("ds", 0, self._grounded("alice", "2026-10-01T00:00:00+00:00"))
+        await service.save_annotation("ds", 0, self._grounded("bob", "2026-10-05T00:00:00+00:00"), if_match=first.etag)
+        await service.save_annotation("ds", 1, self._grounded("carol", "2026-10-06T00:00:00+00:00", "template"))
+        await service.save_annotation("ds", 2, _build_annotation("dave"))
+
+        overview = await service.get_grounding_overview("ds")
+
+        assert overview.annotated == [0, 1, 2]
+        assert [(item.episode_index, item.annotator_id) for item in overview.usable] == [(0, "bob"), (1, "carol")]
+
+    async def test_given_unchanged_annotations_when_listed_again_then_only_changed_files_are_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = LocalStorageAdapter(str(tmp_path))
+        service = AnnotationService(storage_adapter=adapter)
+        saved = await service.save_annotation("ds", 0, self._grounded("alice", "2026-10-01T00:00:00+00:00"))
+        await service.save_annotation("ds", 1, self._grounded("bob", "2026-10-01T00:00:00+00:00"))
+        reads: list[int] = []
+        original = adapter.get_annotation
+
+        async def counted(dataset_id: str, episode_index: int):
+            reads.append(episode_index)
+            return await original(dataset_id, episode_index)
+
+        monkeypatch.setattr(adapter, "get_annotation", counted)
+        await service.get_grounding_overview("ds")
+        assert sorted(reads) == [0, 1]
+        reads.clear()
+
+        await service.get_grounding_overview("ds")
+        assert reads == []
+
+        changed = saved.value.annotations[0].model_copy(deep=True)
+        changed.task_completeness.rating = "unknown"
+        await service.save_annotation("ds", 0, changed, if_match=saved.etag)
+        overview = await service.get_grounding_overview("ds")
+
+        assert reads == [0]
+        assert [item.episode_index for item in overview.usable] == [1]
+
+
 class TestDelete:
     @pytest.mark.parametrize("owner", [None, "alice"])
     async def test_given_saved_edits_when_annotations_deleted_then_edits_survive(

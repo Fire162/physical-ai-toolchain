@@ -706,6 +706,7 @@ export async function submitJudgeJob(
             {
               annotation_author_id: reference.annotationAuthorId,
               annotation_revision: reference.annotationRevision,
+              labels_revision: reference.labelsRevision,
               snapshot_id: reference.snapshotId,
             },
           ]),
@@ -754,6 +755,14 @@ export function fetchJudgeInventory(
   )
 }
 
+export function fetchGroundingOverview(datasetId: string) {
+  return apiRequest<{
+    datasetId: string
+    annotated: number[]
+    usable: { episodeIndex: number; annotatorId: string | null; labelsRevision?: string | null }[]
+  }>(`/datasets/${datasetId}/annotations/grounding`, { cache: 'no-store' })
+}
+
 export function fetchJudgeJobs(datasetId: string, offset = 0) {
   const params = new URLSearchParams({ dataset_id: datasetId, offset: String(offset), limit: '25' })
   return apiRequest<{ items: JudgeJob[]; total: number }>(`/judge/jobs?${params}`, {
@@ -770,15 +779,10 @@ export function fetchJudgeApprovals(datasetId: string) {
 }
 
 export async function fetchJudgeReset(datasetId: string) {
-  try {
-    return await apiRequest<import('@/types/vlm-judge').JudgeReset>(
-      `/judge/resets?${new URLSearchParams({ dataset_id: datasetId })}`,
-      { cache: 'no-store' },
-    )
-  } catch (error) {
-    if (error instanceof ApiClientError && error.status === 404) return null
-    throw error
-  }
+  return apiRequest<import('@/types/vlm-judge').JudgeReset | null>(
+    `/judge/resets?${new URLSearchParams({ dataset_id: datasetId })}`,
+    { cache: 'no-store' },
+  )
 }
 
 export function mutateJudgeDataset(

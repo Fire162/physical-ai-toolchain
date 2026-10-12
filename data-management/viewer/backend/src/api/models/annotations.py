@@ -402,3 +402,19 @@ class AnnotationSummary(SanitizedModel):
     task_completeness_distribution: dict[str, int] = Field(default_factory=dict)
     quality_score_distribution: dict[int, int] = Field(default_factory=dict)
     anomaly_type_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class GroundingEpisode(SanitizedModel):
+    """Episode with a saved instruction and an annotation or label baseline."""
+
+    episode_index: int = Field(ge=0)
+    annotator_id: str | None = None
+    labels_revision: str | None = None
+
+
+class GroundingOverview(SanitizedModel):
+    """Annotated episodes and the subset usable as judge grounding samples."""
+
+    dataset_id: str
+    annotated: list[int] = Field(default_factory=list)
+    usable: list[GroundingEpisode] = Field(default_factory=list)

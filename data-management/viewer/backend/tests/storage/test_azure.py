@@ -261,6 +261,40 @@ class TestAzureBlobStorageAdapter:
 
     @patch("src.api.storage.azure.AZURE_AVAILABLE", True)
     @patch("src.api.storage.azure.BlobServiceClient")
+    async def test_list_annotation_revisions_uses_listing_etags(self, mock_blob_service):
+        from src.api.storage.azure import AzureBlobStorageAdapter
+
+        blobs = []
+        for name, etag in (
+            ("test-dataset/annotations/episodes/episode_000003.json", '"etag-3"'),
+            ("test-dataset/annotations/episodes/episode_bad.json", '"skip"'),
+            ("test-dataset/annotations/episodes/episode_000001.json", None),
+        ):
+            blob = MagicMock()
+            blob.name = name
+            blob.etag = etag
+            blobs.append(blob)
+
+        async def mock_list_blobs(name_starts_with):
+            for blob in blobs:
+                yield blob
+
+        mock_container = MagicMock()
+        mock_container.list_blobs = mock_list_blobs
+        mock_client = MagicMock()
+        mock_client.get_container_client.return_value = mock_container
+        adapter = AzureBlobStorageAdapter(
+            account_name="testaccount",
+            container_name="testcontainer",
+            sas_token="test-sas-token",
+        )
+        adapter._client = mock_client
+
+        assert await adapter.list_annotation_revisions(self.dataset_id) == {3: '"etag-3"', 1: None}
+        mock_container.get_blob_client.assert_not_called()
+
+    @patch("src.api.storage.azure.AZURE_AVAILABLE", True)
+    @patch("src.api.storage.azure.BlobServiceClient")
     async def test_delete_annotation_success(self, mock_blob_service):
         """Test deleting an existing annotation."""
         from src.api.storage.azure import AzureBlobStorageAdapter

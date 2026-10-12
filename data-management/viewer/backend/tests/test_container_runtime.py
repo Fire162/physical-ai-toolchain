@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -71,3 +74,30 @@ def test_browser_gate_cannot_reuse_live_services_or_resolve_dependencies() -> No
     assert "--port 18002" in config
     scenarios = (frontend / "e2e" / "accessibility.spec.ts").read_text()
     assert "http://127.0.0.1:8000/" not in scenarios
+
+
+def test_given_no_http_extra_when_importing_evaluator_api_then_core_models_remain_available() -> None:
+    root = Path(__file__).resolve().parents[4]
+    script = """
+import importlib.abc
+import sys
+
+class NoHttpExtra(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'starlette', 'fastapi'}:
+            raise ModuleNotFoundError('HTTP extra absent', name=fullname.split('.')[0])
+
+sys.meta_path.insert(0, NoHttpExtra())
+from evaluation.vlm_judge.api import JudgeRequest, build_router
+assert JudgeRequest(dataset_id='synthetic', episode_index=0).episode_index == 0
+assert callable(build_router)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

@@ -2,7 +2,7 @@
 title: Dataset Analysis Tool
 description: Run and configure the web application for analyzing and annotating episode-based robotics datasets
 author: Microsoft
-ms.date: 2026-10-05
+ms.date: 2026-10-12
 ms.topic: overview
 ---
 
@@ -283,11 +283,16 @@ contribution linked to the result, while protecting human revisions and unrelate
 
 #### Scoring every episode
 
-1. Open Dataset workspace and select sample episodes with their saved human references.
-2. Evaluate the samples using the chosen model, cameras and scoring method.
-3. Review disagreements or inconclusive results, then approve the configuration.
-4. Select target episodes and submit either judge-only or judge-and-label work.
-5. Follow the saved job's progress. You can close the browser and reconnect later.
+1. Save any episode-label or instruction edits. Select exactly one `SUCCESS`, `FAILURE` or
+  `PARTIAL` label for each grounding episode; conflicting outcome labels cannot form a label baseline.
+2. Open Dataset workspace and select grounding episodes. Each needs a saved instruction or a
+  dataset task instruction. Saved task-completeness ratings are also supported.
+3. Select the cameras and scoring method, then choose **Evaluate grounding episodes**.
+4. Review the saved-baseline versus judge comparisons. Acknowledge disagreements or inconclusive
+  results, then choose **Approve configuration**. Individual episode judge runs do not create approvals.
+5. Select that entry in **Configuration approval** and choose target episodes. Leave the target
+  field empty to select every episode not used for grounding, then submit judge-only or judge-and-label work.
+6. Follow the saved job's progress. You can close the browser and reconnect later.
 
 | Operation       | Effect                                                                                    |
 |-----------------|-------------------------------------------------------------------------------------------|
@@ -298,6 +303,22 @@ contribution linked to the result, while protecting human revisions and unrelate
 | Withdraw        | Previews and removes covered machine contributions; preserves human revisions and history |
 
 Changing the configuration, source or samples invalidates the corresponding approval.
+
+Instruction source is user-selected metadata, not an eligibility restriction. Saved template
+instructions and dataset task instructions are accepted. Episode labels, including AI-applied
+labels, provide baseline outcomes; they do not establish independent human validation. Conflicting
+outcome labels cannot provide a label baseline. No Task Completeness pane is required for label-based
+grounding. The Task Completeness widget is not displayed in the current workspace; use the visible
+Episode Labels controls for label baselines. The approval selector shows **No approved configuration
+yet** until a grounding evaluation is reviewed and approved. Saving labels or annotations refreshes
+eligibility and approval state; unsaved drafts still block new work.
+
+Episode labels, structured annotations and saved judge results are separate records. A SUCCESS
+judge result does not change a label or annotation unless explicitly applied. An applied label can
+be a baseline without being represented as human-authored evidence.
+
+The reset-history read (`GET /api/judge/resets`) returns `200` with `null` when no label removal has
+run. Do not restart a viewer while its job is active.
 
 #### "Run judge" vs. "Language instruction"
 

@@ -334,7 +334,7 @@ class JudgeJobs:
                 index,
                 principal_scope_id=actor,
                 views=tuple(config.get("views") or ()),
-                annotation_author_id=samples[index]["annotation_author_id"]
+                annotation_author_id=samples[index].get("annotation_author_id")
                 if sample
                 else config.get("annotation_author_id"),
                 expected_snapshot_id=samples[index]["snapshot_id"] if sample else expected_snapshots.get(index),

@@ -564,11 +564,22 @@ describe('use-labels hooks', () => {
       mockFetch.mockResolvedValueOnce(
         jsonResponse({ episode_index: 0, labels: ['SUCCESS'] }, { headers: { ETag: 'two' } }),
       )
-      const { result } = renderHookWithProviders(() => useSaveEpisodeLabels())
+      const { result, queryClient } = renderHookWithProviders(() => useSaveEpisodeLabels())
+      const groundingKey = [
+        'judge-dataset',
+        'ds-1',
+        'principal-one',
+        'source-a',
+        'one',
+        'grounding',
+      ]
+      queryClient.setQueryDefaults(['judge-dataset'], { gcTime: Infinity })
+      queryClient.setQueryData(groundingKey, { usable: [] })
       await act(async () => {
         await result.current.mutateAsync({ episodeIdx: 0, labels: ['SUCCESS'] })
       })
       expect(useLabelStore.getState().savedEpisodeLabels[0]).toEqual(['SUCCESS'])
+      expect(queryClient.getQueryState(groundingKey)?.isInvalidated).toBe(true)
     })
 
     it('blocks saving while label draft recovery is pending or failed', async () => {

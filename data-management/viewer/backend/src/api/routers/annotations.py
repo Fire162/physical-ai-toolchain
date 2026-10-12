@@ -7,8 +7,10 @@ annotation summaries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
+from evaluation.vlm_judge.saved_input import label_baseline
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 
 from ..auth import PrincipalContext, require_principal_context
@@ -18,6 +20,8 @@ from ..models.annotations import (
     AutoQualityAnalysis,
     EpisodeAnnotation,
     EpisodeAnnotationFile,
+    GroundingEpisode,
+    GroundingOverview,
 )
 from ..models.datasources import EpisodeData
 from ..models.episode_edits import EpisodeEditState, SaveEpisodeEditsRequest
@@ -25,7 +29,7 @@ from ..services.annotation_service import AnnotationService, EditSourceChangedEr
 from ..services.dataset_service import DatasetService, get_dataset_service
 from ..storage import StorageError
 from ..validation import SAFE_DATASET_ID_PATTERN, path_int_param, path_string_param
-from .labels import RevisionPrecondition, require_revision_precondition
+from .labels import RevisionPrecondition, _get_label_storage, require_revision_precondition
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -345,3 +349,56 @@ async def get_annotation_summary(
         raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
 
     return await service.get_summary(dataset_id, dataset.total_episodes)
+
+
+@router.get(
+    "/datasets/{dataset_id}/annotations/grounding",
+    response_model=GroundingOverview,
+)
+async def get_grounding_overview(
+    dataset_id: str = Depends(path_string_param("dataset_id", pattern=SAFE_DATASET_ID_PATTERN, label="dataset_id")),
+    service: AnnotationService = Depends(get_annotation_service),
+    dataset_service: DatasetService = Depends(get_dataset_service),
+) -> GroundingOverview:
+    """List annotated episodes and those usable as VLM judge grounding samples."""
+    if await dataset_service.get_dataset(dataset_id) is None:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
+    try:
+        overview = await service.get_grounding_overview(dataset_id)
+        labels = await _get_label_storage().load(dataset_id)
+        usable = {episode.episode_index: episode for episode in overview.usable}
+        annotated = set(overview.annotated)
+        limit = asyncio.Semaphore(16)
+
+        async def check_label(index: int) -> None:
+            baseline = label_baseline(labels, index)
+            if baseline is None:
+                return
+            async with limit:
+                record = await dataset_service.get_episode_media_record(dataset_id, index)
+                if record is None:
+                    return
+                annotation = await service.get_annotation(dataset_id, index)
+            annotated.add(index)
+            candidates = [
+                entry
+                for entry in (annotation.annotations if annotation else [])
+                if entry.language_instruction and entry.language_instruction.instruction.strip()
+            ]
+            selected = max(candidates, key=lambda entry: entry.timestamp) if candidates else None
+            instruction = selected.language_instruction.instruction if selected else record.instruction
+            if not instruction.strip():
+                return
+            usable[index] = GroundingEpisode(
+                episode_index=index,
+                annotator_id=selected.annotator_id if selected else None,
+                labels_revision=baseline["revision"],
+            )
+
+        await asyncio.gather(*(check_label(int(index)) for index in labels.episodes))
+        return GroundingOverview(
+            dataset_id=dataset_id, annotated=sorted(annotated), usable=[usable[index] for index in sorted(usable)]
+        )
+    except StorageError as error:
+        logger.error("Grounding overview failed: %s", type(error).__name__)
+        raise HTTPException(status_code=503, detail="Saved annotations are unavailable") from None

@@ -3,6 +3,8 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { AppContent } from '@/App'
+import { DatasetCatalog } from '@/components/app-shell/DatasetCatalog'
+import { DataviewerShellHeader } from '@/components/app-shell/DataviewerShellHeader'
 import { useDatasetStore, useEpisodeStore } from '@/stores'
 import { useLabelStore } from '@/stores/label-store'
 import type { DatasetInfo } from '@/types'
@@ -18,31 +20,39 @@ const { mockIsDiagnosticsEnabled, mockEnableDiagnostics, mockDisableDiagnostics 
 let mockDatasets: DatasetInfo[] = []
 let mockCatalogError: Error | null = null
 const mockCatalogDiagnostic = vi.fn()
+const mockRefreshCatalog = vi.fn()
+const mockCatalogOptions = vi.fn()
+let mockCatalogGroups: string[] = []
+let mockCatalogCount: number | undefined
+let mockCatalogFlags = { loading: false, stale: false, failed: false }
 
 vi.mock('@/hooks/use-datasets', () => ({
   useDatasets: () => ({ data: mockDatasets }),
   useDataset: (id?: string) => ({ data: mockDatasets.find((dataset) => dataset.id === id) }),
-  useDatasetCatalog: (options: { query?: string; offset?: number; limit?: number }) => ({
-    data: {
-      items: mockDatasets
-        .filter((dataset) =>
-          `${dataset.id} ${dataset.name}`.toLowerCase().includes(options.query ?? ''),
-        )
-        .slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 25)),
-      total: mockDatasets.length,
-      catalogTotal: mockDatasets.length,
-      groups: [],
-      snapshotId: 'catalog-revision',
-      offset: 0,
-      limit: 25,
-      stale: false,
-      refreshFailed: false,
-    },
-    isLoading: false,
-    isFetching: false,
-    error: mockCatalogError,
-    refreshCatalog: vi.fn(),
-  }),
+  useDatasetCatalog: (options: { query?: string; offset?: number; limit?: number }) => {
+    mockCatalogOptions(options)
+    return {
+      data: {
+        items: mockDatasets
+          .filter((dataset) =>
+            `${dataset.id} ${dataset.name}`.toLowerCase().includes(options.query ?? ''),
+          )
+          .slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 25)),
+        total: mockDatasets.length,
+        catalogTotal: mockCatalogCount ?? mockDatasets.length,
+        groups: mockCatalogGroups,
+        snapshotId: 'catalog-revision',
+        offset: 0,
+        limit: 25,
+        stale: mockCatalogFlags.stale,
+        refreshFailed: mockCatalogFlags.failed,
+      },
+      isLoading: mockCatalogFlags.loading,
+      isFetching: false,
+      error: mockCatalogError,
+      refreshCatalog: mockRefreshCatalog,
+    }
+  },
   useCapabilities: () => ({ data: undefined }),
   useEpisodes: () => ({
     data: [
@@ -145,6 +155,151 @@ vi.mock('@/components/annotation-workspace/AnnotationWorkspace', () => ({
 }))
 
 describe('AppContent', () => {
+  it('filters the header picker by name and group, resets the filter and selects a dataset', async () => {
+    const user = userEvent.setup()
+    const onSelectDataset = vi.fn()
+    const datasets = [
+      { ...mockDatasets[0], id: 'cell-b--first', name: 'First', group: 'cell-b' },
+      { ...mockDatasets[1], id: 'cell-a--second', name: 'Second', group: 'cell-a' },
+      { ...mockDatasets[0], id: 'standalone', name: 'standalone' },
+    ]
+    render(
+      <DataviewerShellHeader
+        datasetId="cell-b--first"
+        datasets={datasets}
+        diagnosticsVisible={false}
+        onSelectDataset={onSelectDataset}
+        onToggleDiagnostics={vi.fn()}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: 'Dataset' })
+    await user.click(trigger)
+    const filter = screen.getByRole('combobox', { name: 'Filter datasets' })
+    expect(filter).toHaveFocus()
+    await user.type(filter, 'missing')
+    expect(screen.getByText('No datasets match the current filter.')).toBeVisible()
+    await user.keyboard('{Escape}')
+    await user.click(trigger)
+    expect(screen.getByRole('combobox', { name: 'Filter datasets' })).toHaveValue('')
+    await user.type(screen.getByRole('combobox', { name: 'Filter datasets' }), 'cell-a')
+    await user.click(screen.getByRole('option', { name: /second/i }))
+    expect(onSelectDataset).toHaveBeenCalledWith('cell-a--second')
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('exposes header catalog and diagnostics actions, format badges and warming state', async () => {
+    const user = userEvent.setup()
+    const onOpenCatalog = vi.fn()
+    const onToggleDiagnostics = vi.fn()
+    const props = {
+      datasetId: '',
+      datasets: [],
+      diagnosticsVisible: true,
+      onSelectDataset: vi.fn(),
+      onToggleDiagnostics,
+      onOpenCatalog,
+      catalogOpen: true,
+    }
+    const { rerender } = render(
+      <DataviewerShellHeader {...props} capabilities={{ hasHdf5Files: true }} isWarmingCache />,
+    )
+    expect(screen.getByText('HDF5')).toBeVisible()
+    expect(screen.getByText('Warming')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Dataset' })).toHaveTextContent('Select a dataset')
+    await user.click(screen.getByRole('button', { name: 'Dataset' }))
+    await user.click(screen.getByRole('button', { name: 'Toggle Diagnostics' }))
+    expect(onOpenCatalog).toHaveBeenCalledOnce()
+    expect(onToggleDiagnostics).toHaveBeenCalledOnce()
+    expect(screen.getByRole('button', { name: 'Toggle Diagnostics' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    rerender(
+      <DataviewerShellHeader
+        {...props}
+        diagnosticsVisible={false}
+        capabilities={{ isLerobotDataset: true, hasHdf5Files: true }}
+      />,
+    )
+    expect(screen.getByText('LeRobot')).toBeVisible()
+    expect(screen.queryByText('HDF5')).not.toBeInTheDocument()
+    expect(screen.queryByText('Warming')).not.toBeInTheDocument()
+  })
+
+  it('updates catalog grouping and sort, returns to the previous page and refreshes discovery', async () => {
+    const user = userEvent.setup()
+    mockDatasets = Array.from({ length: 30 }, (_, index) => ({
+      ...mockDatasets[0],
+      id: `dataset-${index}`,
+    }))
+    mockCatalogGroups = ['cell--one']
+    mockRefreshCatalog.mockResolvedValue({
+      snapshotId: 'refreshed',
+      total: 30,
+      refreshFailed: false,
+    })
+    render(<DatasetCatalog visible selectedId="" onSelect={vi.fn()} onReturn={vi.fn()} />)
+    await user.click(screen.getByRole('button', { name: 'Next catalog page' }))
+    expect(screen.getByRole('button', { name: 'Previous catalog page' })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: 'Previous catalog page' }))
+    expect(mockCatalogOptions).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0 }))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Group' }), 'cell--one')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Sort' }), 'episodes-desc')
+    expect(mockCatalogOptions).toHaveBeenLastCalledWith(
+      expect.objectContaining({ group: 'cell--one', sort: 'episodes-desc' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Refresh catalog' }))
+    await waitFor(() =>
+      expect(mockCatalogOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({ snapshotId: 'refreshed' }),
+      ),
+    )
+    expect(mockCatalogDiagnostic).toHaveBeenCalledWith('navigation', 'catalog-refresh-result', {
+      failed: false,
+      count: 30,
+    })
+  })
+
+  it('retains catalog entries after refresh rejection and offers button and keyboard return', async () => {
+    const user = userEvent.setup()
+    const onReturn = vi.fn()
+    mockRefreshCatalog.mockRejectedValue(new Error('private query'))
+    render(
+      <DatasetCatalog
+        visible
+        selectedId="houston_lerobot_fixed"
+        onSelect={vi.fn()}
+        onReturn={onReturn}
+      />,
+    )
+    await user.click(screen.getByRole('button', { name: 'Refresh catalog' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Previous discovery is retained')
+    expect(screen.getByRole('option', { name: /houston_lerobot_fixed/ })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Return to episode' }))
+    await user.keyboard('{Escape}')
+    expect(onReturn).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(mockCatalogDiagnostic.mock.calls)).not.toContain('private query')
+  })
+
+  it('distinguishes loading, empty discovery, no matches and stale catalog status', () => {
+    mockDatasets = []
+    mockCatalogFlags.loading = true
+    const props = { visible: true, selectedId: '', onSelect: vi.fn(), onReturn: vi.fn() }
+    const { rerender } = render(<DatasetCatalog {...props} />)
+    expect(screen.getByText('Loading datasets...')).toBeVisible()
+    mockCatalogFlags.loading = false
+    rerender(<DatasetCatalog {...props} />)
+    expect(screen.getByText('No datasets available.')).toBeVisible()
+    mockCatalogCount = 10
+    mockCatalogFlags.stale = true
+    rerender(<DatasetCatalog {...props} />)
+    expect(screen.getByText('No datasets match the current filters.')).toBeVisible()
+    expect(screen.getByText('Catalog snapshot is stale.')).toBeVisible()
+    mockCatalogFlags.failed = true
+    rerender(<DatasetCatalog {...props} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Catalog refresh failed')
+  })
+
   it('replaces both episode panes while retaining drafts and frame state without autoplay', async () => {
     const user = userEvent.setup()
     render(<AppContent />)
@@ -217,6 +372,11 @@ describe('AppContent', () => {
   })
   beforeEach(() => {
     mockCatalogError = null
+    mockCatalogGroups = []
+    mockCatalogCount = undefined
+    mockCatalogFlags = { loading: false, stale: false, failed: false }
+    mockCatalogOptions.mockClear()
+    mockRefreshCatalog.mockReset()
     mockCatalogDiagnostic.mockClear()
     window.history.replaceState(null, '', '/?dataset=houston_lerobot_fixed')
     mockDatasets = [
