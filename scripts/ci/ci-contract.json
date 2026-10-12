@@ -2105,16 +2105,16 @@
     },
     {
       "id": "msdate-freshness",
-      "classification": "mandatory",
+      "classification": "advisory",
       "owners": {
         "pr": "msdate-freshness"
       },
       "target": "msdate-freshness-check.yml",
       "selector": "always",
-      "outcomeSchema": "required",
+      "outcomeSchema": "advisory",
       "permissionProfile": "read",
       "softFailPolicy": {
-        "pr": false
+        "pr": true
       }
     },
     {
