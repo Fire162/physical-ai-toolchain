@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -224,6 +224,19 @@ describe('AppContent', () => {
     expect(screen.getByText('LeRobot')).toBeVisible()
     expect(screen.queryByText('HDF5')).not.toBeInTheDocument()
     expect(screen.queryByText('Warming')).not.toBeInTheDocument()
+  })
+
+  it('names catalog results and supports forward and reverse keyboard focus', async () => {
+    const user = userEvent.setup()
+    render(<DatasetCatalog visible selectedId="" onSelect={vi.fn()} onReturn={vi.fn()} />)
+    const filter = screen.getByRole('combobox', { name: 'Filter datasets' })
+    expect(filter).toHaveFocus()
+    const listbox = screen.getByRole('listbox', { name: 'Available datasets' })
+    expect(filter).toHaveAttribute('aria-controls', listbox.id)
+    await user.tab()
+    expect(within(listbox).getAllByRole('option')[0]).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(filter).toHaveFocus()
   })
 
   it('updates catalog grouping and sort, returns to the previous page and refreshes discovery', async () => {

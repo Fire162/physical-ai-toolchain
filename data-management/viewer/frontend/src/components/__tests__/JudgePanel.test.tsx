@@ -359,6 +359,9 @@ describe('JudgePanel', () => {
         denied: 'Dataset operation access is denied.',
       }[state]
       expect(screen.getByText(message!)).toBeVisible()
+      if (state !== 'denied') {
+        expect(screen.getByText('Judge operations are unavailable.')).toBeVisible()
+      }
       expect(screen.queryByRole('button', { name: 'Refresh dataset jobs' })).not.toBeInTheDocument()
       expect(
         screen.queryByRole('button', {

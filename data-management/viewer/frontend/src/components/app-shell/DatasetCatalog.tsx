@@ -175,7 +175,7 @@ export function DatasetCatalog({ visible, selectedId, onSelect, onReturn }: Data
           <CommandList
             id="catalog-results"
             role="listbox"
-            aria-label="Available datasets"
+            label="Available datasets"
             className="max-h-none"
             aria-busy={catalog.isFetching}
           >
@@ -191,13 +191,15 @@ export function DatasetCatalog({ visible, selectedId, onSelect, onReturn }: Data
                   lastSelection.current = dataset.id
                   onSelect(dataset.id)
                 }}
-                className="flex flex-wrap items-center justify-between gap-2 border-b py-3"
+                className="group flex flex-wrap items-center justify-between gap-2 border-b py-3"
               >
                 <span className="min-w-0 flex-1 break-all">
                   <span className="block font-medium">{dataset.id}</span>
-                  <span className="text-muted-foreground text-sm">{dataset.name}</span>
+                  <span className="text-muted-foreground group-aria-selected:text-accent-foreground text-sm">
+                    {dataset.name}
+                  </span>
                 </span>
-                <span className="text-muted-foreground text-sm">
+                <span className="text-muted-foreground group-aria-selected:text-accent-foreground text-sm">
                   {dataset.totalEpisodes} episodes{dataset.format ? ` · ${dataset.format}` : ''}
                 </span>
               </CommandItem>

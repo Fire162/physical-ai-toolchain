@@ -1,5 +1,6 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { useState } from 'react'
 import type { MockedFunction } from 'vitest'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -113,6 +114,50 @@ describe('JointConfigDefaultsEditor', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     expect(screen.getByText('shoulder')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  })
+
+  it('retains the draft after a save conflict and restores opener focus on Escape', async () => {
+    const user = userEvent.setup()
+    const groups = [{ id: 'arm', label: 'Arm', indices: [0] }]
+    const labels = { '0': 'shoulder' }
+    const onSave = vi.fn<OnSaveFn>()
+    function StatefulEditor() {
+      const [open, setOpen] = useState(false)
+      const [saveError, setSaveError] = useState<string>()
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>Edit defaults</button>
+          <JointConfigDefaultsEditor
+            open={open}
+            onOpenChange={setOpen}
+            groups={groups}
+            labels={labels}
+            onSave={(config) => {
+              onSave(config)
+              setSaveError('Settings changed elsewhere.')
+            }}
+            saveError={saveError}
+          />
+        </>
+      )
+    }
+    render(<StatefulEditor />)
+    const opener = screen.getByRole('button', { name: 'Edit defaults' })
+    await user.click(opener)
+    expect(screen.getByRole('button', { name: 'Edit group label' })).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Edit joint label' }))
+    const input = screen.getByDisplayValue('shoulder')
+    await user.clear(input)
+    await user.type(input, 'wrist{Enter}')
+    const saveButton = screen.getByRole('button', { name: 'Save' })
+    await user.click(saveButton)
+    expect(onSave).toHaveBeenCalledWith({ groups, labels: { '0': 'wrist' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('Settings changed elsewhere.')
+    expect(screen.getByText('wrist')).toBeInTheDocument()
+    expect(saveButton).toHaveFocus()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    await waitFor(() => expect(opener).toHaveFocus())
   })
 
   it('shows duplicate-index alert and disables Save when indices collide', async () => {

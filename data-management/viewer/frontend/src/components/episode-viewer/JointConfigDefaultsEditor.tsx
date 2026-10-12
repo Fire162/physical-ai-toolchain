@@ -233,6 +233,7 @@ export function JointConfigDefaultsEditor({
   const [movingJoint, setMovingJoint] = useState<string | null>(null)
   const [editingIndex, setEditingIndex] = useState<string | null>(null)
   const groupRefs = useRef(new Map<string, HTMLDivElement>())
+  const openerRef = useRef<HTMLElement | null>(null)
 
   // Reset local state when dialog opens with new props
   useEffect(() => {
@@ -361,7 +362,17 @@ export function JointConfigDefaultsEditor({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[80vh] max-w-2xl flex-col">
+      <DialogContent
+        className="flex max-h-[80vh] max-w-2xl flex-col"
+        onOpenAutoFocus={() => {
+          openerRef.current =
+            document.activeElement instanceof HTMLElement ? document.activeElement : null
+        }}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault()
+          openerRef.current?.focus()
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings className="h-5 w-5" />

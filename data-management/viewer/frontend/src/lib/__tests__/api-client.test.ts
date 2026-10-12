@@ -120,7 +120,7 @@ describe('ApiClientError', () => {
     )
   })
 
-  it('uses revision-bound saved-edit and label responses in the accessibility fixture', async () => {
+  it('uses revision-bound saved-edit, label, and joint-config responses in the accessibility fixture', async () => {
     let handler: ((route: Route) => Promise<unknown>) | undefined
     await installApiFixture({
       route: async (_pattern: string, callback: typeof handler) => {
@@ -196,6 +196,64 @@ describe('ApiClientError', () => {
     expect(
       (await request(`${base}/episodes/0/labels`, 'PUT', { labels: [] }, { 'if-match': revision! }))
         .status,
+    ).toBe(412)
+
+    const configPaths = [
+      `${base}/joint-config`,
+      '/api/datasets/a11y-secondary/joint-config',
+      '/api/joint-config/defaults',
+    ]
+    const baselineConfig = {
+      labels: { '0': 'shoulder_joint', '1': 'target_joint' },
+      groups: [{ id: 'arm', label: 'Arm', indices: [0, 1] }],
+    }
+    for (const [index, path] of configPaths.entries()) {
+      const baselineResponse = await request(path)
+      expect(await baselineResponse.json()).toMatchObject(baselineConfig)
+      const baselineRevision = baselineResponse.headers.get('ETag')
+      expect(baselineRevision).toBeTruthy()
+      const config = {
+        labels: { '0': `saved-shoulder-${index}`, '1': `saved-target-${index}` },
+        groups: [{ id: 'arm', label: `Saved arm ${index}`, indices: [1, 0] }],
+      }
+      const configSave = await request(path, 'PUT', config, { 'if-match': baselineRevision! })
+      expect(configSave.status).toBe(200)
+      expect(await configSave.json()).toMatchObject(config)
+      const savedRevision = configSave.headers.get('ETag')
+      expect(savedRevision).toBeTruthy()
+      expect(savedRevision).not.toBe(baselineRevision)
+      const readback = await request(path)
+      expect(await readback.json()).toMatchObject(config)
+      expect(readback.headers.get('ETag')).toBe(savedRevision)
+      expect(
+        (await request(path, 'PUT', baselineConfig, { 'if-match': baselineRevision! })).status,
+      ).toBe(412)
+      const afterConflict = await request(path)
+      expect(await afterConflict.json()).toMatchObject(config)
+      expect(afterConflict.headers.get('ETag')).toBe(savedRevision)
+    }
+    for (const [index, path] of configPaths.entries()) {
+      expect(await (await request(path)).json()).toMatchObject({
+        dataset_id: index === 2 ? '_defaults' : path.split('/')[3],
+        labels: { '0': `saved-shoulder-${index}`, '1': `saved-target-${index}` },
+        groups: [{ id: 'arm', label: `Saved arm ${index}`, indices: [1, 0] }],
+      })
+    }
+    await installApiFixture(
+      {
+        route: async (_pattern: string, callback: typeof handler) => {
+          handler = callback
+        },
+      } as unknown as Page,
+      { jointConfig: 'conflict' },
+    )
+    const conflictBaseline = await request(configPaths[0])
+    expect(
+      (
+        await request(configPaths[0], 'PUT', baselineConfig, {
+          'if-match': conflictBaseline.headers.get('ETag')!,
+        })
+      ).status,
     ).toBe(412)
   })
 

@@ -306,7 +306,11 @@ function DatasetWorkspaceContent({
             </Button>
           </div>
         </div>
-        {!enabled && <p role={accessError ? 'alert' : 'status'}>{unavailableReason}</p>}
+        {!enabled && (
+          <p role={accessError ? 'alert' : 'status'}>
+            <span>Judge operations are unavailable.</span> <span>{unavailableReason}</span>
+          </p>
+        )}
         {enabled && workspace.denied && <p role="alert">Dataset operation access is denied.</p>}
         {canMutate && (
           <>

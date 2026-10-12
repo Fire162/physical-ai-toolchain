@@ -197,6 +197,16 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
   )
   const savedEdits = new Map<string, { revision: number; operations: Record<string, unknown> }>()
   const savedAnnotations = new Map<string, { revision: number; annotations: unknown[] }>()
+  const jointConfigStates = new Map(
+    [...activeDatasets.map((dataset) => dataset.id), '_defaults'].map((id) => [
+      id,
+      {
+        revision: 0,
+        labels: { '0': 'shoulder_joint', '1': 'target_joint' } as Record<string, string>,
+        groups: [{ id: 'arm', label: 'Arm', indices: [0, 1] }],
+      },
+    ]),
+  )
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -333,18 +343,25 @@ export async function installApiFixture(page: Page, options: ApiFixtureOptions =
       )
     }
     if (path.endsWith('/joint-config') || path === '/api/joint-config/defaults') {
-      if (method === 'PUT' && options.jointConfig === 'conflict') {
-        return json({ code: 'REVISION_CONFLICT', message: 'Synthetic settings conflict' }, 412)
+      const configId = path === '/api/joint-config/defaults' ? '_defaults' : datasetId
+      const state = jointConfigStates.get(configId)
+      if (!state) return json({ detail: 'Dataset not found' }, 404)
+      const revision = state.revision ? `"settings-${state.revision}"` : '"settings-baseline"'
+      if (method === 'PUT') {
+        if (options.jointConfig === 'conflict') {
+          return json({ code: 'REVISION_CONFLICT', message: 'Synthetic settings conflict' }, 412)
+        }
+        if (!matchesRevision(revision)) return json({ detail: 'Revision conflict' }, 412)
+        const body = request.postDataJSON() as {
+          labels: Record<string, string>
+          groups: { id: string; label: string; indices: number[] }[]
+        }
+        state.labels = { ...body.labels }
+        state.groups = body.groups.map((group) => ({ ...group, indices: [...group.indices] }))
+        state.revision++
       }
-      return route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        headers: { ETag: method === 'PUT' ? '"settings-saved"' : '"settings-baseline"' },
-        body: JSON.stringify({
-          dataset_id: path === '/api/joint-config/defaults' ? '_defaults' : path.split('/')[3],
-          labels: { '0': 'shoulder_joint', '1': 'target_joint' },
-          groups: [{ id: 'arm', label: 'Arm', indices: [0, 1] }],
-        }),
+      return json({ dataset_id: configId, labels: state.labels, groups: state.groups }, 200, {
+        ETag: state.revision ? `"settings-${state.revision}"` : revision,
       })
     }
     if (path.endsWith('/annotations')) {
