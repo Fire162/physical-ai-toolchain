@@ -43,6 +43,40 @@ def _make_directory_blob(name: str) -> MagicMock:
     return blob
 
 
+@pytest.mark.parametrize("case", ["metadata", "index", "columns", "location", "path", "bytes", "v3"])
+async def test_given_episode_sync_inputs_when_materializing_then_only_valid_shard_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    provider = create_blob_dataset_provider()
+    metadata = tmp_path / "meta" / "episodes"
+    metadata.mkdir(parents=True)
+    template = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+    if case == "path":
+        template = "outside/episode_{episode_index:06d}.parquet"
+    (tmp_path / "meta" / "info.json").write_text(json.dumps({"total_episodes": 2, "data_path": template}))
+    rows = [{"episode_index": 0, "data/chunk_index": 1, "data/file_index": 2}]
+    if case == "columns":
+        rows = [{"episode_index": 0}]
+    elif case == "location":
+        rows = [{"episode_index": 1, "data/chunk_index": 1, "data/file_index": 2}]
+    pq.write_table(pa.Table.from_pylist(rows), metadata / "file.parquet")
+    monkeypatch.setattr(provider, "sync_meta_only_to_local", AsyncMock(return_value=case != "metadata"))
+    monkeypatch.setattr(provider, "_read_blob_bytes", AsyncMock(return_value=None if case == "bytes" else b"shard"))
+
+    if case == "path":
+        with pytest.raises(ValueError, match="Invalid episode data path"):
+            await provider.sync_episode_to_local("ds", tmp_path, 0)
+    else:
+        result = await provider.sync_episode_to_local("ds", tmp_path, 2 if case == "index" else 0)
+        assert result is (case == "v3")
+    target = tmp_path / "data" / "chunk-001" / "file-002.parquet"
+    assert target.exists() is (case == "v3")
+    if case == "v3":
+        assert target.read_bytes() == b"shard"
+
+
 class TestImportGuard:
     """Module-level Azure availability guard."""
 

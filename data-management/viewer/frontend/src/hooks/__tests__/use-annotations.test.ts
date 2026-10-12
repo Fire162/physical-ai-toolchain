@@ -217,6 +217,115 @@ describe('saved episode edits', () => {
     },
   }
 
+  it.each([
+    { schema_version: '2.0.0' },
+    { dataset_id: 'other' },
+    { episode_index: 1 },
+    { source_id: 'other' },
+    { source_revision: 'other' },
+    { author_id: 'other' },
+    { operations: { ...operations, datasetId: 'other' } },
+    { operations: { ...operations, episodeIndex: 1 } },
+  ])('rejects a saved descriptor with mismatched scope: %j', async (changed) => {
+    mockFetch.mockResolvedValue(
+      jsonResponse(
+        { ...state, saved: { ...state.saved, ...changed } },
+        { headers: { ETag: 'one' } },
+      ),
+    )
+    const { result } = renderHookWithProviders(() => useEpisodeEdits('ds-1', 0, 'me'))
+
+    await waitFor(() => expect(result.current.isError).toBe(true))
+
+    expect(result.current.error?.message).toContain('descriptor scope')
+    expect(useEditStore.getState().serverBaseline).toBeNull()
+  })
+
+  it.each(['missing', 'identity', 'revision'])(
+    'rejects a saved edit acknowledgment with changed source: %s',
+    async (change) => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(state, { headers: { ETag: 'one' } }))
+      const { result } = renderHookWithProviders(() => ({
+        read: useEpisodeEdits('ds-1', 0, 'me'),
+        save: useSaveEpisodeEdits(),
+      }))
+      await waitFor(() => expect(result.current.read.isReady).toBe(true))
+      act(() => useEditStore.getState().toggleFrameRemoval(5))
+      const submitted = {
+        ...useEditStore.getState().serverBaseline!,
+        operations: useEditStore.getState().getEditOperations()!,
+      }
+      mockMutationFetch(
+        jsonResponse(
+          {
+            ...state,
+            source_id: change === 'identity' ? 'other' : state.source_id,
+            source_revision: change === 'revision' ? 'other' : state.source_revision,
+            saved: change === 'missing' ? null : state.saved,
+          },
+          { headers: { ETag: 'two' } },
+        ),
+      )
+
+      await act(async () => {
+        await expect(result.current.save.mutateAsync(submitted)).rejects.toThrow('source changed')
+      })
+
+      expect(useEditStore.getState().serverBaseline?.etag).toBe('one')
+      expect(useEditStore.getState().isDirty).toBe(true)
+    },
+  )
+
+  it.each(['keep', 'discard'] as const)(
+    'resolves a recovered edit draft with the %s decision',
+    async (choice) => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(state, { headers: { ETag: 'one' } }))
+      const { result } = renderHookWithProviders(() => useEpisodeEdits('ds-1', 0, 'me'))
+      await waitFor(() => expect(result.current.isReady).toBe(true))
+      act(() => useEditStore.getState().toggleFrameRemoval(5))
+      mockFetch.mockResolvedValueOnce(jsonResponse(state, { headers: { ETag: 'two' } }))
+
+      await act(async () => {
+        await result.current.refetch()
+      })
+      await waitFor(() => expect(result.current.resolveRecoveredEdits).not.toBeNull())
+      act(() => result.current.resolveRecoveredEdits!(choice))
+
+      await waitFor(() => expect(result.current.isReady).toBe(true))
+      expect(useEditStore.getState().serverBaseline?.etag).toBe('two')
+      expect(useEditStore.getState().removedFrames.has(5)).toBe(choice === 'keep')
+      expect(useEditStore.getState().isDirty).toBe(choice === 'keep')
+    },
+  )
+
+  it.each(['scope', 'hydration', 'recovery', 'validation'])(
+    'blocks edit saves with unresolved %s',
+    async (failure) => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(state, { headers: { ETag: 'one' } }))
+      const { result } = renderHookWithProviders(() => ({
+        read: useEpisodeEdits('ds-1', 0, 'me'),
+        save: useSaveEpisodeEdits(),
+      }))
+      await waitFor(() => expect(result.current.read.isReady).toBe(true))
+      const submitted = useEditStore.getState().serverBaseline!
+      act(() => {
+        if (failure === 'scope')
+          useEditStore.setState({ serverBaseline: { ...submitted, sourceRevision: 'changed' } })
+        if (failure === 'hydration') useEditStore.setState({ draftHydrated: false })
+        if (failure === 'recovery') useEditStore.setState({ draftError: 'Recovery failed' })
+        if (failure === 'validation')
+          useEditStore.setState({ validationErrors: ['Invalid frame range'] })
+      })
+      mockFetch.mockClear()
+
+      await act(async () => {
+        await expect(result.current.save.mutateAsync(submitted)).rejects.toThrow('Load and resolve')
+      })
+
+      expect(mockFetch).not.toHaveBeenCalled()
+    },
+  )
+
   it('hydrates server edits without renaming camera keys and saves against the loaded revision', async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse(state, { headers: { ETag: 'revision-a' } }))
     const { result } = renderHookWithProviders(() => ({

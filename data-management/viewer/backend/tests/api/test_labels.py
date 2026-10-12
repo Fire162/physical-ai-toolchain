@@ -53,6 +53,109 @@ class LabelBlobProvider:
         return {"etag": self.etag}
 
 
+@pytest.mark.parametrize("failure", ["directory", "encoding"])
+async def test_given_unreadable_local_labels_when_loading_then_safe_failure(
+    tmp_path: Path,
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = labels_mod.LocalLabelStorage(str(tmp_path))
+    path = tmp_path / "ds" / "meta" / "episode_labels.json"
+    path.parent.mkdir(parents=True)
+    if failure == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b"\xffprivate-content")
+
+    with pytest.raises(HTTPException) as error:
+        await storage.load("ds")
+
+    assert error.value.status_code == 500
+    assert error.value.detail == "Failed to read labels"
+    assert "private-content" not in caplog.text
+
+
+async def test_given_blob_labels_without_validator_when_loading_then_fails_closed() -> None:
+    provider = LabelBlobProvider(b'{"dataset_id":"ds"}', etag="")
+
+    with pytest.raises(HTTPException) as error:
+        await labels_mod.BlobLabelStorage(provider).load("ds")
+
+    assert error.value.status_code == 500
+    assert error.value.detail == "Failed to load labels"
+
+
+@pytest.mark.parametrize("operation", ["labels", "analysis", "import-analysis", "import-labels"])
+async def test_given_foreign_contribution_when_mutating_then_conflict_preserves_document(
+    client: TestClient,
+    dataset_service: MagicMock,
+    tmp_path: Path,
+    operation: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = labels_mod.LocalLabelStorage(str(tmp_path))
+    document = labels_mod.DatasetLabelsFile(dataset_id="ownership")
+    if operation in {"labels", "import-analysis"}:
+        document.apply_analysis(0, labels_mod.EpisodeAnalysisRecord(object="private-value"), author_id="other-author")
+    else:
+        document.apply_labels(0, ["OBJECT: PRIVATE"], author_id="other-author")
+        if operation == "import-labels":
+            document.analysis["0"] = labels_mod.EpisodeAnalysisRecord(object="blue")
+    etag = await storage.save("ownership", document, if_none_match=True)
+    if operation.startswith("import"):
+        response = client.post(
+            "/api/datasets/ownership/labels/import-from-analysis",
+            headers={"If-Match": etag},
+            json={"field": "object", "overwrite": True},
+        )
+    else:
+        response = client.put(
+            f"/api/datasets/ownership/episodes/0/{operation}",
+            headers={"If-Match": etag},
+            json={"labels": ["SUCCESS"], "intent": "human-edit"} if operation == "labels" else {"notes": "new"},
+        )
+
+    assert response.status_code == 409
+    assert "ownership requires explicit author selection" in response.json()["detail"]
+    current = await storage.load_versioned("ownership")
+    assert current.etag == etag
+    assert current.value == document
+    dataset_service.invalidate_episode_cache.assert_not_called()
+    assert "private-value" not in caplog.text
+    assert "other-author" not in response.text
+
+
+async def test_given_legacy_analysis_when_promoted_then_lineage_created_and_empty_episode_preserved(
+    client: TestClient,
+    dataset_service: MagicMock,
+    tmp_path: Path,
+) -> None:
+    storage = labels_mod.LocalLabelStorage(str(tmp_path))
+    document = labels_mod.DatasetLabelsFile(
+        dataset_id="ownership",
+        episodes={"0": ["CUSTOM"], "1": []},
+        analysis={"0": labels_mod.EpisodeAnalysisRecord(object="blue")},
+    )
+    etag = await storage.save("ownership", document, if_none_match=True)
+
+    response = client.post(
+        "/api/datasets/ownership/labels/import-from-analysis",
+        headers={"If-Match": etag},
+        json={"field": "object"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["episodes"] == {"0": ["CUSTOM", "OBJECT: BLUE"], "1": []}
+    assert "CUSTOM" in response.json()["available_labels"]
+    current = await storage.load("ownership")
+    contributions = current.provenance["0"].contributions
+    source = next(item for item in contributions if item.field == "analysis/object")
+    derived = next(item for item in contributions if item.field == "labels/OBJECT: BLUE")
+    assert source.origin == "legacy-unknown"
+    assert derived.derived_from == [source.id]
+    assert derived.id in current.provenance["0"].acceptances
+
+
 @pytest.fixture
 def dataset_service(client: TestClient) -> Iterator[MagicMock]:
     """Override the dataset service at the FastAPI dependency boundary."""

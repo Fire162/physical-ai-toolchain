@@ -185,6 +185,34 @@ class TestContributionLedger:
 
 
 class TestSaveAndGet:
+    async def test_given_instruction_adoption_when_machine_proposes_then_rejected_without_write(
+        self,
+        service: AnnotationService,
+    ) -> None:
+        from src.api.models.annotations import LanguageInstructionAnnotation
+        from src.api.models.contributions import MachineOrigin
+
+        original = _build_annotation()
+        saved = await service.save_annotation("ds", 0, original, if_none_match=True)
+        proposal = original.model_copy(deep=True)
+        proposal.language_instruction = LanguageInstructionAnnotation(instruction="Move the block", source="template")
+        proposal.instruction_adoption = {"instruction": "template"}
+        origin = MachineOrigin(
+            run_id="run",
+            result_id="result",
+            run_order=1,
+            source_revision="source",
+            input_revision="input",
+            config_revision="config",
+        )
+
+        with pytest.raises(ValueError, match="Invalid instruction adoption scope"):
+            await service.save_annotation("ds", 0, proposal, machine_origin=origin, if_match=saved.etag)
+
+        current = await service.get_annotation_versioned("ds", 0)
+        assert current.etag == saved.etag
+        assert current.value == saved.value
+
     def test_given_missing_instruction_when_adoption_requested_then_schema_rejects_it(self) -> None:
         with pytest.raises(ValueError, match="adoption"):
             EpisodeAnnotation.model_validate(
@@ -465,6 +493,44 @@ class TestSaveAndGet:
 
 
 class TestGroundingOverview:
+    async def test_given_unversioned_annotations_when_reloaded_then_read_again_without_caching(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        adapter = LocalStorageAdapter(str(tmp_path))
+        service = AnnotationService(storage_adapter=adapter)
+        await service.save_annotation("ds", 0, self._grounded("alice", "2026-10-01T00:00:00+00:00"))
+        monkeypatch.setattr(adapter, "list_annotation_revisions", AsyncMock(return_value={0: None}))
+        read = AsyncMock(wraps=adapter.get_annotation)
+        monkeypatch.setattr(adapter, "get_annotation", read)
+
+        first = await service.get_grounding_overview("ds")
+        second = await service.get_grounding_overview("ds")
+
+        assert first == second
+        assert read.await_count == 2
+        assert not service._grounding_cache
+
+    async def test_given_full_grounding_cache_when_new_episodes_loaded_then_oldest_entries_evicted(
+        self,
+        service: AnnotationService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("src.api.services.annotation_service._GROUNDING_CACHE_LIMIT", 2)
+        service._grounding_cache[("other", 0)] = ("older-revision", "alice")
+        for index in range(3):
+            await service.save_annotation("ds", index, self._grounded("alice", "2026-10-01T00:00:00+00:00"))
+
+        overview = await service.get_grounding_overview("ds")
+
+        assert overview.annotated == [0, 1, 2]
+        assert [item.episode_index for item in overview.usable] == [0, 1, 2]
+        assert len(service._grounding_cache) == 2
+        assert ("other", 0) not in service._grounding_cache
+
     @staticmethod
     def _grounded(annotator_id: str, saved_at: str, source: str = "human") -> EpisodeAnnotation:
         from src.api.models.annotations import LanguageInstructionAnnotation
@@ -582,6 +648,162 @@ class TestDelete:
 
 
 class TestSavedEdits:
+    @pytest.mark.parametrize(
+        "segments",
+        [
+            [("one", (3, 1))],
+            [("one", (0, 1)), ("one", (3, 4))],
+            [("one", (0, 3)), ("two", (3, 4))],
+        ],
+    )
+    async def test_given_invalid_subtasks_when_saving_then_no_descriptor_persisted(
+        self,
+        service: AnnotationService,
+        segments: list[tuple[str, tuple[int, int]]],
+    ) -> None:
+        with pytest.raises(ValueError):
+            operations = EpisodeEditOperations(
+                datasetId="ds",
+                episodeIndex=0,
+                subtasks=[
+                    {"id": identity, "label": "Phase", "frameRange": frames, "color": "#123456", "source": "manual"}
+                    for identity, frames in segments
+                ],
+            )
+            await service.save_edits(
+                "ds",
+                0,
+                operations,
+                author_id="alice",
+                source_id="source",
+                source_revision="revision",
+                frame_count=10,
+                cameras=set(),
+                if_none_match=True,
+            )
+
+        assert await service.get_annotation("ds", 0) is None
+
+    @pytest.mark.parametrize("precondition", [{}, {"if_match": '"one"', "if_none_match": True}])
+    async def test_given_ambiguous_precondition_when_saving_edits_then_rejected(
+        self,
+        service: AnnotationService,
+        precondition: dict[str, object],
+    ) -> None:
+        with pytest.raises(ValueError, match="Exactly one revision"):
+            await service.save_edits(
+                "ds",
+                0,
+                EpisodeEditOperations(datasetId="ds", episodeIndex=0),
+                author_id="alice",
+                source_id="source",
+                source_revision="revision",
+                frame_count=10,
+                cameras=set(),
+                **precondition,
+            )
+
+        assert await service.get_annotation("ds", 0) is None
+
+    async def test_given_mismatched_operation_identity_when_saving_edits_then_rejected(
+        self,
+        service: AnnotationService,
+    ) -> None:
+        with pytest.raises(ValueError, match="identity does not match"):
+            await service.save_edits(
+                "ds",
+                0,
+                EpisodeEditOperations(datasetId="another", episodeIndex=0),
+                author_id="alice",
+                source_id="source",
+                source_revision="revision",
+                frame_count=10,
+                cameras=set(),
+                if_none_match=True,
+            )
+
+        assert await service.get_annotation("ds", 0) is None
+
+    @pytest.mark.parametrize("wrong_scope", ["dataset_id", "episode_index", "source_id", "author_id"])
+    async def test_given_wrong_descriptor_scope_when_reading_edits_then_rejected(
+        self,
+        service: AnnotationService,
+        monkeypatch: pytest.MonkeyPatch,
+        wrong_scope: str,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from src.api.models.episode_edits import SavedEpisodeEdits
+        from src.api.storage import VersionedValue
+
+        descriptor = SavedEpisodeEdits(
+            dataset_id="ds",
+            episode_index=0,
+            source_id="source",
+            source_revision="revision",
+            author_id="alice",
+            operations=EpisodeEditOperations(datasetId="ds", episodeIndex=0),
+            updated_at=datetime.now(UTC),
+        ).model_copy(update={wrong_scope: 1 if wrong_scope == "episode_index" else "wrong"})
+        descriptor = descriptor.model_copy(
+            update={
+                "operations": EpisodeEditOperations(
+                    datasetId=descriptor.dataset_id,
+                    episodeIndex=descriptor.episode_index,
+                )
+            }
+        )
+        envelope = EpisodeAnnotationFile(
+            dataset_id="ds", episode_index=0, saved_edits={"source": {"alice": descriptor}}
+        )
+        monkeypatch.setattr(
+            service._storage,
+            "get_annotation_versioned",
+            AsyncMock(
+                return_value=VersionedValue(
+                    value=envelope,
+                    etag='"one"',
+                )
+            ),
+        )
+
+        with pytest.raises(ValueError, match="Saved edit scope mismatch"):
+            await service.get_saved_edits("ds", 0, author_id="alice", source_id="source", source_revision="revision")
+
+    def test_given_mismatched_descriptor_identity_when_validated_then_rejected(self) -> None:
+        from src.api.models.episode_edits import SavedEpisodeEdits
+
+        with pytest.raises(ValueError, match="identity does not match"):
+            SavedEpisodeEdits(
+                dataset_id="ds",
+                episode_index=0,
+                source_id="source",
+                source_revision="revision",
+                author_id="alice",
+                operations=EpisodeEditOperations(datasetId="other", episodeIndex=0),
+                updated_at=datetime.now(UTC),
+            )
+
+    async def test_given_failed_storage_read_when_loading_edits_then_safe_error_logged(
+        self,
+        service: AnnotationService,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from src.api.storage import StorageError
+
+        monkeypatch.setattr(
+            service._storage, "get_annotation_versioned", AsyncMock(side_effect=StorageError("private-data"))
+        )
+
+        with pytest.raises(StorageError):
+            await service.get_saved_edits("ds", 0, author_id="alice", source_id="source", source_revision="revision")
+
+        assert "Saved edit read failed" in caplog.text
+        assert "private-data" not in caplog.text
+
     async def test_given_scoped_edits_when_saved_and_cleared_then_durable_state_is_distinct(
         self,
         tmp_path: Path,

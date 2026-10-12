@@ -22,7 +22,12 @@ import {
   persistEditDraft,
   persistLabelDraft,
 } from '@/lib/edit-draft-storage'
-import { checkEpisodeReadiness } from '@/lib/episode-readiness'
+import {
+  assertEpisodeReadiness,
+  assertSnapshotCurrent,
+  checkEpisodeReadiness,
+  pendingWorkspaceChanges,
+} from '@/lib/episode-readiness'
 import {
   useAnnotationStore,
   useDatasetStore,
@@ -107,6 +112,164 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks())
 
 describe('selected episode readiness', () => {
+  it.each([[], [-1], [0.5], [Number.NaN]].map((indices) => ({ indices })))(
+    'rejects an invalid selection $indices',
+    async ({ indices }) => {
+      const queryClient = createTestQueryClient()
+      queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+      queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+
+      await expect(assertEpisodeReadiness(queryClient, 'ds-1', indices)).rejects.toThrow(
+        'Select valid episodes',
+      )
+    },
+  )
+
+  it.each(['dirty', 'hydrating', 'recovery', 'validation', 'baseline'] as const)(
+    'blocks selected episode edits with %s state',
+    async (reason) => {
+      const queryClient = createTestQueryClient()
+      queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+      queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+      useEditStore.setState({
+        datasetId: 'ds-1',
+        episodeIndex: 0,
+        principalScopeId: 'principal-one',
+        isDirty: reason === 'dirty',
+        draftHydrated: reason !== 'hydrating',
+        draftError: reason === 'recovery' ? 'unavailable' : null,
+        validationErrors: reason === 'validation' ? ['Invalid frame'] : [],
+        serverBaseline:
+          reason === 'baseline'
+            ? null
+            : {
+                sourceId: 'source',
+                sourceRevision: 'one',
+                principalScopeId: 'principal-one',
+                etag: null,
+                operations: { datasetId: 'ds-1', episodeIndex: 0 },
+              },
+      })
+
+      await expect(assertEpisodeReadiness(queryClient, 'ds-1', [0])).rejects.toThrow(
+        'Episode 0: Save or resolve episode edits',
+      )
+    },
+  )
+
+  it('blocks an edit baseline bound to a replaced source', async () => {
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { gcTime: Infinity } })
+    queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+    useEpisodeStore.setState({
+      currentEpisode: {
+        sourceId: 'source',
+        sourceRevision: 'new',
+        meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+        cameras: [],
+        videoUrls: {},
+        trajectoryData: [],
+      },
+    })
+    useEditStore.setState({
+      datasetId: 'ds-1',
+      episodeIndex: 0,
+      principalScopeId: 'principal-one',
+      draftHydrated: true,
+      serverBaseline: {
+        sourceId: 'source',
+        sourceRevision: 'old',
+        principalScopeId: 'principal-one',
+        etag: null,
+        operations: { datasetId: 'ds-1', episodeIndex: 0 },
+      },
+    })
+
+    await expect(assertEpisodeReadiness(queryClient, 'ds-1', [0])).rejects.toThrow(
+      'episode source changed',
+    )
+  })
+
+  it.each(['snapshotId', 'datasetId', 'episodeIndex', 'principalScopeId'] as const)(
+    'rejects a snapshot with stale %s',
+    async (field) => {
+      const queryClient = createTestQueryClient()
+      queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+      const snapshot = await fetchVlmJudgeSnapshot('ds-1', 0)
+      const stale = {
+        ...snapshot,
+        [field]: field === 'episodeIndex' ? 1 : field === 'snapshotId' ? '' : 'other',
+      }
+
+      expect(() => assertSnapshotCurrent(queryClient, 'ds-1', 0, stale)).toThrow(
+        'another episode or identity',
+      )
+    },
+  )
+
+  it.each(['sourceId', 'sourceRevision', 'annotationRevision', 'editRevision'] as const)(
+    'rejects a snapshot whose current %s changed',
+    async (field) => {
+      const queryClient = createTestQueryClient()
+      queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+      useDatasetStore.setState({
+        currentDataset: {
+          id: 'ds-1',
+          name: 'Dataset',
+          totalEpisodes: 1,
+          fps: 30,
+          features: {},
+          tasks: [],
+        },
+      })
+      useEpisodeStore.setState({
+        currentIndex: 0,
+        currentEpisode: {
+          sourceId: 'source',
+          sourceRevision: 'one',
+          meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+          cameras: [],
+          videoUrls: {},
+          trajectoryData: [],
+        },
+      })
+      useEditStore.setState({
+        serverBaseline: {
+          sourceId: 'source',
+          sourceRevision: 'one',
+          principalScopeId: 'principal-one',
+          etag: null,
+          operations: { datasetId: 'ds-1', episodeIndex: 0 },
+        },
+      })
+      const snapshot = await fetchVlmJudgeSnapshot('ds-1', 0)
+
+      expect(() =>
+        assertSnapshotCurrent(queryClient, 'ds-1', 0, { ...snapshot, [field]: 'stale' }),
+      ).toThrow('saved snapshot changed')
+    },
+  )
+
+  it('lists all pending resource kinds and scopes dirty labels to the selected episode', () => {
+    useAnnotationStore.setState({ isDirty: true, draftError: 'failed' })
+    useEditStore.setState({ isDirty: true })
+    useLabelStore.setState({
+      isSaving: true,
+      episodeLabels: { 0: ['SUCCESS'], 1: ['FAILURE'] },
+      savedEpisodeLabels: {},
+      conflict: { episodeIndex: 1, currentEtag: 'new', submittedLabels: ['FAILURE'] },
+    })
+
+    expect(pendingWorkspaceChanges(undefined, { episodeIndex: 1 })).toEqual([
+      'annotation changes',
+      'an unresolved conflict',
+      'draft recovery errors',
+      'a label save in progress',
+      'label changes for episode 1',
+      'frame or subtask edits',
+    ])
+  })
+
   it('retains evidence on refresh failure, excludes denied or replaced sources, and never runs inference', async () => {
     const queryClient = createTestQueryClient()
     queryClient.setDefaultOptions({ queries: { gcTime: Infinity, retry: false } })

@@ -176,6 +176,61 @@ def test_given_no_revision_when_saving_joint_config_then_requires_precondition(c
     assert response.status_code == 428
 
 
+def test_given_azure_download_without_revision_when_reading_then_fails_closed(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SettingsBlobProvider()
+
+    async def download() -> SimpleNamespace:
+        async def readall() -> bytes:
+            return b'{"dataset_id":"ds-one"}'
+
+        return SimpleNamespace(readall=readall, properties=SimpleNamespace(etag=None))
+
+    monkeypatch.setattr(provider, "download_blob", download)
+    monkeypatch.setattr(joint_config, "_get_blob_provider", lambda: provider)
+
+    response = client.get("/api/datasets/ds-one/joint-config")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to read joint configuration"
+
+
+@pytest.mark.parametrize("failure", ["missing-revision", "server-error", "already-exists", "precondition"])
+def test_given_azure_write_failure_when_saving_then_reports_safe_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from azure.core.exceptions import HttpResponseError
+
+    provider = SettingsBlobProvider()
+
+    async def upload(content: bytes, **conditions: object) -> dict[str, str]:
+        if failure == "missing-revision":
+            return {}
+        error = HttpResponseError("private-provider-payload")
+        error.status_code = {"server-error": 503, "already-exists": 409, "precondition": 412}[failure]
+        error.error_code = "BlobAlreadyExists" if failure == "already-exists" else None
+        raise error
+
+    monkeypatch.setattr(provider, "upload_blob", upload)
+    monkeypatch.setattr(joint_config, "_get_blob_provider", lambda: provider)
+
+    response = client.put(
+        "/api/datasets/ds-one/joint-config",
+        json={"labels": {"0": "Arm"}},
+        headers={"If-None-Match": "*"},
+    )
+
+    assert response.status_code == (500 if failure in {"missing-revision", "server-error"} else 412)
+    assert "private-provider-payload" not in response.text
+    assert "private-provider-payload" not in caplog.text
+    assert provider.objects == {}
+
+
 class TestDatasetJointConfig:
     """Per-dataset joint configuration endpoints."""
 

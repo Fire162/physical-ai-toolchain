@@ -1,19 +1,96 @@
 import '@/components/__tests__/support/annotationWorkspaceTestSupport'
 
 import { act } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   mockRecordDiagnosticEvent,
+  mockSaveAnnotation,
+  mockSaveEpisodeDraft,
+  mockTogglePlayback,
   setupAnnotationWorkspaceTestCase,
   teardownAnnotationWorkspaceTestCase,
+  testState,
 } from '@/components/__tests__/support/annotationWorkspaceTestSupport'
 import { useAnnotationWorkspaceShell } from '@/components/annotation-workspace/useAnnotationWorkspaceShell'
+import * as annotationHooks from '@/hooks/use-annotations'
+import * as principalHooks from '@/hooks/use-principal-context'
+import { ApiClientError } from '@/lib/api-client'
 import { renderHookWithProviders } from '@/test-utils/render'
 
 describe('useAnnotationWorkspaceShell', () => {
   beforeEach(setupAnnotationWorkspaceTestCase)
-  afterEach(teardownAnnotationWorkspaceTestCase)
+  afterEach(() => {
+    teardownAnnotationWorkspaceTestCase()
+    vi.restoreAllMocks()
+  })
+
+  it.each(['pending', 'failed'])(
+    'blocks workspace saves while identity is %s',
+    async (identity) => {
+      testState.hasAnnotationChanges = true
+      vi.spyOn(principalHooks, 'usePrincipalContext').mockReturnValue({
+        data: identity === 'pending' ? undefined : { scopeId: 'principal-test', authMode: 'local' },
+        error: identity === 'failed' ? new Error('Identity unavailable') : null,
+      } as ReturnType<typeof principalHooks.usePrincipalContext>)
+      const { result } = renderHookWithProviders(() => useAnnotationWorkspaceShell({}))
+
+      await act(async () => {
+        await result.current.handleSaveEpisode()
+      })
+
+      expect(result.current.saveStatusMessage).toBe('Reload your identity before saving.')
+      expect(mockSaveAnnotation).not.toHaveBeenCalled()
+      expect(mockSaveEpisodeDraft).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([401, 403, 404])(
+    'blocks workspace saves after annotation access error %s',
+    async (status) => {
+      testState.hasAnnotationChanges = true
+      const useEpisodeAnnotations = annotationHooks.useEpisodeAnnotations
+      vi.spyOn(annotationHooks, 'useEpisodeAnnotations').mockImplementation((...args) => ({
+        ...useEpisodeAnnotations(...args),
+        data: undefined,
+        error: new ApiClientError('Access unavailable', 'ACCESS_UNAVAILABLE', status),
+        status: 'error',
+        isError: true,
+        isLoadingError: true,
+        isRefetchError: false,
+        isPending: false,
+        isLoading: false,
+        isSuccess: false,
+        isPlaceholderData: false,
+      }))
+      const { result } = renderHookWithProviders(() => useAnnotationWorkspaceShell({}))
+
+      await act(async () => {
+        await result.current.handleSaveEpisode()
+      })
+
+      expect(result.current.saveStatusMessage).toBe(
+        'Annotation access is unavailable. Reload before saving.',
+      )
+      expect(mockSaveAnnotation).not.toHaveBeenCalled()
+      expect(testState.hasAnnotationChanges).toBe(true)
+    },
+  )
+
+  it('stops playback when the workspace becomes hidden', () => {
+    testState.isPlaying = true
+    const { rerender } = renderHookWithProviders(
+      ({ visible }) => useAnnotationWorkspaceShell({ visible }),
+      {
+        initialProps: { visible: true },
+      },
+    )
+    expect(mockTogglePlayback).not.toHaveBeenCalled()
+
+    rerender({ visible: false })
+
+    expect(mockTogglePlayback).toHaveBeenCalledOnce()
+  })
 
   it('defaults the workspace shell to the trajectory tab', () => {
     const { result } = renderHookWithProviders(() => useAnnotationWorkspaceShell({}))

@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react'
 import type { SyntheticEvent } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useAnnotationWorkspaceVideoSync } from '@/components/annotation-workspace/useAnnotationWorkspaceVideoSync'
 import type { FrameInsertion } from '@/types/episode-edit'
@@ -36,6 +36,90 @@ describe('useAnnotationWorkspaceVideoSync', () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  it('pauses normal playback synchronization while the document is hidden', () => {
+    const options = playbackOptions({ videoSrc: '/source.mp4' })
+    const { result, rerender, unmount } = renderHook(
+      ({ isPlaying }) => useAnnotationWorkspaceVideoSync({ ...options, isPlaying }),
+      { initialProps: { isPlaying: false } },
+    )
+    const video = document.createElement('video')
+    video.pause = vi.fn()
+    video.play = vi.fn(() => Promise.resolve())
+    result.current.videoRef.current = video
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+
+    rerender({ isPlaying: true })
+
+    expect(video.pause).toHaveBeenCalled()
+    expect(video.play).not.toHaveBeenCalled()
+    expect(options.onRecordEvent).not.toHaveBeenCalledWith(
+      'playback',
+      'sync-action',
+      expect.anything(),
+    )
+    unmount()
+  })
+
+  it('does not resume or seek video playback while the document is hidden', () => {
+    const options = playbackOptions({ videoSrc: '/source.mp4' })
+    const { result, unmount } = renderHook(() => useAnnotationWorkspaceVideoSync(options))
+    const video = document.createElement('video')
+    video.pause = vi.fn()
+    video.play = vi.fn(() => Promise.resolve())
+    result.current.videoRef.current = video
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+
+    act(() => {
+      result.current.handleResumePlayback(3)
+      vi.advanceTimersByTime(20)
+    })
+
+    expect(video.pause).toHaveBeenCalledOnce()
+    expect(video.play).not.toHaveBeenCalled()
+    expect(video.currentTime).toBe(0)
+    unmount()
+  })
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    'resumes media with a non-finite duration: %s',
+    (duration) => {
+      const { result, unmount } = renderHook(() =>
+        useAnnotationWorkspaceVideoSync(playbackOptions({ videoSrc: '/source.mp4' })),
+      )
+      const video = document.createElement('video')
+      Object.defineProperty(video, 'duration', { configurable: true, value: duration })
+      video.pause = vi.fn()
+      video.play = vi.fn(() => Promise.resolve())
+      result.current.videoRef.current = video
+
+      act(() => {
+        result.current.handleResumePlayback(3)
+        vi.advanceTimersByTime(20)
+      })
+
+      expect(video.currentTime).toBeCloseTo(0.301)
+      expect(video.play).toHaveBeenCalledOnce()
+      unmount()
+    },
+  )
+
+  it.each([false, true])(
+    'gates frame-only autoplay on document visibility: hidden=%s',
+    (hidden) => {
+      vi.spyOn(document, 'hidden', 'get').mockReturnValue(hidden)
+      const options = playbackOptions({ autoPlay: true })
+      const { unmount } = renderHook(() => useAnnotationWorkspaceVideoSync(options))
+
+      expect(options.onTogglePlayback).toHaveBeenCalledTimes(hidden ? 0 : 1)
+      unmount()
+    },
+  )
 
   it.each([false, true])(
     'advances frame-only playback and %s loop behavior within selected bounds',

@@ -35,6 +35,75 @@ afterEach(() => {
 })
 
 describe('useDatasets', () => {
+  it('refreshes catalog filters from the first page and caches the new snapshot', async () => {
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { gcTime: Infinity, retry: false } })
+    queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+    const options = { query: 'cube', group: 'team', offset: 50, limit: 25, snapshotId: 'old' }
+    mockFetch.mockResolvedValueOnce(jsonResponse({ items: [], total: 70, snapshot_id: 'old' }))
+    const { result } = renderHookWithProviders(() => useDatasetCatalog(options), { queryClient })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ items: [sampleDataset], total: 71, snapshot_id: 'new' }),
+    )
+    let refreshed: Awaited<ReturnType<typeof result.current.refreshCatalog>> | undefined
+
+    await act(async () => {
+      refreshed = await result.current.refreshCatalog()
+    })
+
+    const params = new URL(mockFetch.mock.lastCall![0], 'http://localhost').searchParams
+    expect(params.get('offset')).toBe('0')
+    expect(params.get('snapshot_id')).toBeNull()
+    expect(params.get('refresh')).toBe('true')
+    expect(params.get('query')).toBe('cube')
+    expect(params.get('group')).toBe('team')
+    expect(
+      queryClient.getQueryData([
+        'datasets',
+        'catalog',
+        'principal-one',
+        { ...options, offset: 0, snapshotId: 'new' },
+      ]),
+    ).toEqual(refreshed)
+  })
+
+  it.each([401, 403])('hides retained catalog results after access denial %s', async (status) => {
+    const queryClient = createTestQueryClient()
+    queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ items: [sampleDataset], total: 1, snapshot_id: 'one' }),
+    )
+    const { result } = renderHookWithProviders(() => useDatasetCatalog({}), { queryClient })
+    await waitFor(() => expect(result.current.data?.items).toHaveLength(1))
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: 'Unavailable' }, status))
+
+    await act(async () => {
+      await result.current.refetch()
+    })
+
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    expect(result.current.data).toBeUndefined()
+  })
+
+  it('retains the previous catalog snapshot when an explicit refresh fails', async () => {
+    const queryClient = createTestQueryClient()
+    queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'principal-one' })
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ items: [sampleDataset], total: 1, snapshot_id: 'one' }),
+    )
+    const { result } = renderHookWithProviders(() => useDatasetCatalog({}), { queryClient })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: 'Unavailable' }, 503))
+
+    await act(async () => {
+      await expect(result.current.refreshCatalog()).rejects.toThrow()
+    })
+
+    expect(result.current.data?.snapshotId).toBe('one')
+    expect(result.current.data?.items).toHaveLength(1)
+  })
+
   it('queries bounded catalog summaries without fetching episodes or full dataset detail', async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({ scope_id: 'principal-one', auth_mode: 'local' }))
     mockFetch.mockResolvedValueOnce(

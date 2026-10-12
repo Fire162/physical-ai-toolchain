@@ -102,6 +102,149 @@ function judgeResult(partial: Partial<VlmJudgeResult> = {}): VlmJudgeResult {
 }
 
 describe('JudgePanel', () => {
+  it('describes every withdrawal disposition before and after removal', async () => {
+    const user = userEvent.setup()
+    const fields = [
+      { episodeIndex: 0, field: 'labels/AI', disposition: 'removable_fields', runIds: ['run-one'] },
+      { episodeIndex: 1, field: 'labels/HUMAN', disposition: 'preserved_human' },
+      { episodeIndex: 2, field: 'labels/LEGACY', disposition: 'legacy_unknown' },
+      {
+        episodeIndex: 3,
+        field: 'labels/RESTORED',
+        disposition: 'legacy_unknown',
+        reason: 'legacy_value_restored',
+        runIds: ['old-run'],
+      },
+      {
+        episodeIndex: 4,
+        field: 'labels/OWNERS',
+        disposition: 'conflicts',
+        reason: 'multiple_human_authors',
+        humanAuthors: 2,
+      },
+      { episodeIndex: 5, field: 'labels/UNKNOWN', disposition: 'conflicts' },
+    ]
+    const summary = {
+      fields,
+      removableFields: 1,
+      preservedHuman: 1,
+      legacyUnknown: 2,
+      conflicts: 2,
+      episodes: 6,
+      acceptedUnchanged: 0,
+    }
+    mockDatasetAction.mockResolvedValue({ id: 'preview', summary })
+    const workspace = {
+      inventory: {},
+      jobs: {},
+      approvals: {},
+      review: {},
+      reset: { data: { id: 'reset', status: 'succeeded', summary } },
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    }
+    mockDatasetJobs.mockReturnValue(workspace)
+    mockBatch.mockReturnValue({ submit: vi.fn(), isPending: false })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+    expect(screen.getByText(/Removed: AI value.*run-one/)).toBeVisible()
+    expect(screen.getByText(/Kept: a person edited/)).toBeVisible()
+    expect(screen.getByText(/Kept: origin unknown/)).toBeVisible()
+    expect(screen.getByText(/value existed before AI labeling.*old-run/)).toBeVisible()
+    expect(screen.getByText(/2 people edited this value/)).toBeVisible()
+    expect(screen.getByText(/ownership could not be resolved/)).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Preview label removal' }))
+
+    expect(screen.getByText(/Will be removed: AI value.*run-one/)).toBeVisible()
+  })
+
+  it('can deselect and reselect camera views before evaluating a sample', async () => {
+    const user = userEvent.setup()
+    const submit = vi.fn().mockResolvedValue({ id: 'sample' })
+    mockBatch.mockReturnValue({ submit, isPending: false })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { data: { items: [0, 1], total: 2 } },
+      annotated: { data: [0] },
+      usable: { data: [0] },
+      jobs: {},
+      approvals: {},
+      reset: {},
+      review: {},
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    mockSampleEvidence.mockReturnValue({
+      data: [{ index: 0, reference: { snapshotId: 'snapshot', labelsRevision: 'labels' } }],
+    })
+    useEpisodeStore.setState({
+      currentEpisode: {
+        meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+        cameras: ['front', 'wrist'],
+        videoUrls: {},
+        trajectoryData: [],
+      },
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+
+    await user.click(screen.getByRole('checkbox', { name: 'front' }))
+    expect(screen.getByRole('checkbox', { name: 'wrist' })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: 'front' }))
+    await user.click(screen.getByRole('button', { name: 'Evaluate grounding episodes' }))
+
+    expect(submit).toHaveBeenCalledWith(
+      expect.objectContaining({ options: { processMethod: 'gvl', views: ['wrist', 'front'] } }),
+    )
+  })
+
+  it('enforces both grounding and episode-list size limits', async () => {
+    const user = userEvent.setup()
+    mockBatch.mockReturnValue({ submit: vi.fn(), isPending: false })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { data: { items: Array.from({ length: 30 }, (_, index) => index), total: 30 } },
+      jobs: {},
+      approvals: {},
+      reset: {},
+      review: {},
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+
+    await user.type(screen.getByRole('textbox', { name: 'Grounding episodes' }), '0-25')
+
+    expect(screen.getByText('Use at most 25 grounding episodes.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Evaluate grounding episodes' })).toBeDisabled()
+    expect(parseEpisodeList('0-10000').error).toBe('Enter at most 10000 episodes.')
+    expect(parseEpisodeList('0-25', new Set()).error).toContain(', ...')
+  })
+
+  it('keeps sample controls available after a rejected submission', async () => {
+    const user = userEvent.setup()
+    const submit = vi.fn().mockRejectedValue(new Error('Synthetic submission failure'))
+    mockBatch.mockReturnValue({ submit, isPending: false })
+    mockDatasetJobs.mockReturnValue({
+      inventory: { data: { items: [0], total: 1 } },
+      annotated: { data: [0] },
+      usable: { data: [0] },
+      jobs: {},
+      approvals: {},
+      reset: {},
+      review: {},
+      act: mockDatasetAction,
+      refresh: vi.fn(),
+    })
+    mockSampleEvidence.mockReturnValue({
+      data: [{ index: 0, reference: { snapshotId: 'snapshot', labelsRevision: 'labels' } }],
+    })
+    render(<DatasetWorkspace datasetId="demo" open enabled onToggle={vi.fn()} />)
+
+    await user.click(screen.getByRole('button', { name: 'Evaluate grounding episodes' }))
+
+    expect(submit).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Evaluate grounding episodes' })).toBeEnabled()
+    expect(screen.queryByText(/Job review:/)).not.toBeInTheDocument()
+  })
+
   it('reviews label baselines, approves the configuration and submits both target modes', async () => {
     const user = userEvent.setup()
     const submit = vi.fn().mockResolvedValue({ id: 'sample' })

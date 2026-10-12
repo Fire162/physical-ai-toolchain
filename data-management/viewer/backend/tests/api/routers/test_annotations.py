@@ -340,6 +340,102 @@ def test_get_annotations_dataset_not_found_returns_404(client: TestClient, overr
     assert "ds-1" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [
+        ("dataset", 404),
+        ("revision", 503),
+        ("episode-read", 503),
+        ("episode", 404),
+        ("empty", 404),
+        ("recheck", 503),
+        ("changed", 409),
+    ],
+)
+def test_given_unavailable_edit_source_when_reading_then_reports_specific_safe_failure(
+    client: TestClient,
+    override_services: tuple,
+    failure: str,
+    status: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    datasets, _ = override_services
+    datasets.get_dataset.return_value = None if failure == "dataset" else _make_dataset()
+    datasets.get_source_revision = AsyncMock(return_value=("source", "revision"))
+    datasets.get_episode.return_value = EpisodeData(
+        meta=EpisodeMeta(index=0, length=0 if failure == "empty" else 10, task_index=0),
+    )
+    if failure == "revision":
+        datasets.get_source_revision.side_effect = ValueError("private-source-detail")
+    elif failure == "episode-read":
+        datasets.get_episode.side_effect = ValueError("private-source-detail")
+    elif failure == "episode":
+        datasets.get_episode.return_value = None
+    elif failure == "recheck":
+        datasets.get_source_revision.side_effect = [("source", "revision"), ValueError("private-source-detail")]
+    elif failure == "changed":
+        datasets.get_source_revision.side_effect = [("source", "revision"), ("source", "replacement")]
+
+    response = client.get("/api/datasets/ds-1/episodes/0/edits")
+
+    assert response.status_code == status
+    assert "private-source-detail" not in caplog.text + response.text
+
+
+@pytest.mark.parametrize("has_etag", [False, True])
+def test_given_stale_saved_edit_when_reading_then_returns_source_conflict(
+    client: TestClient,
+    override_services: tuple,
+    has_etag: bool,
+) -> None:
+    from src.api.services.annotation_service import EditSourceChangedError
+
+    datasets, annotations = override_services
+    datasets.get_dataset.return_value = _make_dataset()
+    datasets.get_source_revision = AsyncMock(return_value=("source", "revision"))
+    datasets.get_episode.return_value = EpisodeData(
+        meta=EpisodeMeta(index=0, length=10, task_index=0),
+    )
+    annotations.get_saved_edits = AsyncMock(side_effect=EditSourceChangedError('"saved-v1"' if has_etag else None))
+
+    response = client.get("/api/datasets/ds-1/episodes/0/edits")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["source_revision"] == "revision"
+    assert response.headers.get("etag") == ('"saved-v1"' if has_etag else None)
+
+
+@pytest.mark.parametrize("failure", ["read", "acknowledgment"])
+def test_given_edit_storage_failure_when_accessing_then_no_success_acknowledgment(
+    client: TestClient,
+    override_services: tuple,
+    failure: str,
+) -> None:
+    datasets, annotations = override_services
+    datasets.get_dataset.return_value = _make_dataset()
+    datasets.get_source_revision = AsyncMock(return_value=("source", "revision"))
+    datasets.get_episode.return_value = EpisodeData(
+        meta=EpisodeMeta(index=0, length=10, task_index=0),
+    )
+    if failure == "read":
+        annotations.get_saved_edits = AsyncMock(side_effect=StorageError("private-storage-detail"))
+        response = client.get("/api/datasets/ds-1/episodes/0/edits")
+    else:
+        annotations.save_edits = AsyncMock(return_value=VersionedValue(value=None, etag=None))
+        response = client.put(
+            "/api/datasets/ds-1/episodes/0/edits",
+            headers={"If-None-Match": "*"},
+            json={
+                "source_id": "source",
+                "source_revision": "revision",
+                "operations": {"datasetId": "ds-1", "episodeIndex": 0},
+            },
+        )
+
+    assert response.status_code == 500
+    assert "private-storage-detail" not in response.text
+
+
 def test_get_annotations_returns_empty_when_none_exist(client: TestClient, override_services) -> None:
     dataset_service, annotation_service = override_services
     dataset_service.get_dataset.return_value = _make_dataset()

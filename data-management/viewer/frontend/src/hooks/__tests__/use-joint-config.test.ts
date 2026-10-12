@@ -13,6 +13,7 @@ import {
   mockFetch,
   mockMutationFetch,
 } from '@/test-utils/fetch-mocks'
+import { renderHookWithProviders } from '@/test-utils/render'
 
 beforeEach(() => {
   installFetchMock({ csrf: false })
@@ -25,6 +26,73 @@ afterEach(() => {
 })
 
 describe('joint config API functions', () => {
+  it('loads versioned defaults and saves a create-only revision into the cache', async () => {
+    const { jointConfigKeys, useJointConfigDefaults, useSaveJointConfigDefaults } =
+      await import('@/hooks/use-joint-config')
+    const config = { datasetId: '_defaults', labels: { '0': 'Joint' }, groups: [] }
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ dataset_id: '_defaults', labels: {}, groups: [] }),
+    )
+    const { result, queryClient } = renderHookWithProviders(() => ({
+      read: useJointConfigDefaults(),
+      save: useSaveJointConfigDefaults(),
+    }))
+    await waitFor(() => expect(result.current.read.isSuccess).toBe(true))
+    expect(result.current.read.etag).toBeNull()
+    mockMutationFetch(jsonResponse(config, { headers: { ETag: 'saved-defaults' } }))
+
+    await act(async () => {
+      await result.current.save.mutateAsync({ config, etag: null })
+    })
+
+    expect(queryClient.getQueryData(jointConfigKeys.defaults())).toEqual({
+      data: config,
+      etag: 'saved-defaults',
+    })
+  })
+
+  it.each(['dataset', 'defaults'])(
+    'rejects %s settings before a baseline has loaded',
+    async (kind) => {
+      const { useSaveJointConfig, useSaveJointConfigDefaults } =
+        await import('@/hooks/use-joint-config')
+      const { result } = renderHookWithProviders(() =>
+        kind === 'dataset' ? useSaveJointConfig() : useSaveJointConfigDefaults(),
+      )
+
+      await act(async () => {
+        await expect(
+          result.current.mutateAsync({
+            config: { datasetId: 'ds-1', labels: {}, groups: [] },
+            etag: undefined,
+          }),
+        ).rejects.toThrow(/Load joint/)
+      })
+
+      expect(mockFetch).not.toHaveBeenCalled()
+    },
+  )
+
+  it('rejects a settings acknowledgment without a revision and preserves the dirty config', async () => {
+    const { useSaveJointConfig } = await import('@/hooks/use-joint-config')
+    const config = { datasetId: 'ds-1', labels: { '0': 'Saved' }, groups: [] }
+    useJointConfigStore.getState().setConfig(config, 'one')
+    useJointConfigStore.getState().updateLabel(0, 'Unsaved')
+    const submitted = useJointConfigStore.getState().config
+    mockMutationFetch(jsonResponse(submitted))
+    const { result } = renderHookWithProviders(() => useSaveJointConfig())
+
+    await act(async () => {
+      await expect(result.current.mutateAsync({ config: submitted, etag: 'one' })).rejects.toThrow(
+        'Settings save revision was not returned',
+      )
+    })
+
+    expect(useJointConfigStore.getState().savedConfig).toEqual(config)
+    expect(useJointConfigStore.getState().config).toEqual(submitted)
+    expect(useJointConfigStore.getState().baseEtag).toBe('one')
+  })
+
   it('saveJointConfig sends X-CSRF-Token header', async () => {
     const { saveJointConfigApi } = await import('@/hooks/use-joint-config')
     const responseData = {

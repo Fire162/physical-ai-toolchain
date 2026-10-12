@@ -1,4 +1,4 @@
-import { screen, waitFor } from '@testing-library/react'
+import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it } from 'vitest'
 
@@ -103,6 +103,189 @@ describe('DraftConflictDialog', () => {
     expect(await screen.findByText(/current source is unavailable/i)).toBeVisible()
     expect(useLabelStore.getState().conflict?.sourceChanged).toBe(true)
   })
+
+  it.each(['dataset', 'episode', 'principal', 'source', 'annotation'] as const)(
+    'retains the annotation draft when %s changes during reload',
+    async (change) => {
+      const baseline = annotation('base')
+      const local = annotation('unsaved')
+      useAnnotationStore.getState().loadAnnotation(baseline)
+      useAnnotationStore.getState().resolveConflict(local, baseline, 'one')
+      useAnnotationStore.getState().setConflict('two', local)
+      const queryClient = createTestQueryClient()
+      queryClient.setDefaultOptions({ queries: { retry: false, gcTime: Infinity } })
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ scope_id: 'principal-one', auth_mode: 'local' }))
+        .mockImplementationOnce(async () => {
+          act(() => {
+            if (change === 'dataset') useDatasetStore.setState({ currentDataset: null })
+            if (change === 'episode') useEpisodeStore.setState({ currentIndex: 1 })
+            if (change === 'principal')
+              queryClient.setQueryData(['auth', 'principal-context'], { scopeId: 'another' })
+            if (change === 'source')
+              useEpisodeStore.setState({
+                currentEpisode: {
+                  sourceId: 'replacement',
+                  sourceRevision: 'new',
+                  meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+                  cameras: [],
+                  videoUrls: {},
+                  trajectoryData: [],
+                },
+              })
+            if (change === 'annotation')
+              useAnnotationStore.setState({
+                editGeneration: useAnnotationStore.getState().editGeneration + 1,
+              })
+          })
+          return jsonResponse({ annotations: [annotation('server')] }, { headers: { ETag: 'two' } })
+        })
+      renderWithQuery(<DraftConflictDialog />, queryClient)
+      await waitFor(() =>
+        expect(queryClient.getQueryData(['auth', 'principal-context'])).toBeDefined(),
+      )
+
+      await userEvent.click(screen.getByRole('button', { name: 'Prefer local conflicts' }))
+
+      expect(
+        await screen.findByText(
+          change === 'annotation'
+            ? /annotation changed while reloading/i
+            : /active context changed/i,
+        ),
+      ).toBeVisible()
+      expect(useAnnotationStore.getState().currentAnnotation?.notes).toBe('unsaved')
+      expect(useAnnotationStore.getState().conflict).not.toBeNull()
+    },
+  )
+
+  it.each(['server', 'local'] as const)(
+    'resolves a source-changed annotation using %s without merging old-source fields',
+    async (resolution) => {
+      const baseline = annotation('base', 3)
+      const local = annotation('local', 3)
+      useEpisodeStore.setState({
+        currentEpisode: {
+          sourceId: 'source',
+          sourceRevision: 'new',
+          meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+          cameras: [],
+          videoUrls: {},
+          trajectoryData: [],
+        },
+      })
+      useAnnotationStore.getState().loadAnnotation(baseline)
+      useAnnotationStore.getState().resolveConflict(local, baseline, 'one')
+      useAnnotationStore.getState().setConflict('two', local)
+      useAnnotationStore.setState({
+        conflict: { ...useAnnotationStore.getState().conflict!, sourceChanged: true },
+      })
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ scope_id: 'principal-one', auth_mode: 'local' }))
+        .mockResolvedValueOnce(
+          jsonResponse({ annotations: [annotation('server', 5)] }, { headers: { ETag: 'two' } }),
+        )
+      const queryClient = createTestQueryClient()
+      queryClient.setDefaultOptions({ queries: { retry: false, gcTime: Infinity } })
+      renderWithQuery(<DraftConflictDialog />, queryClient)
+      await waitFor(() =>
+        expect(queryClient.getQueryData(['auth', 'principal-context'])).toBeDefined(),
+      )
+
+      await userEvent.click(screen.getByRole('button', { name: `Prefer ${resolution} conflicts` }))
+
+      await waitFor(() => expect(useAnnotationStore.getState().conflict).toBeNull())
+      expect(useAnnotationStore.getState().currentAnnotation?.notes).toBe(
+        resolution === 'local' ? 'local' : 'server',
+      )
+      expect(useAnnotationStore.getState().currentAnnotation?.trajectoryQuality.overallScore).toBe(
+        resolution === 'local' ? 3 : 5,
+      )
+    },
+  )
+
+  it('creates a fresh baseline when the server annotation was deleted', async () => {
+    const baseline = annotation('base')
+    const local = annotation('unsaved')
+    useAnnotationStore.getState().loadAnnotation(baseline)
+    useAnnotationStore.getState().resolveConflict(local, baseline, 'one')
+    useAnnotationStore.getState().setConflict('two', local)
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({ scope_id: 'principal-one', auth_mode: 'local' }))
+      .mockResolvedValueOnce(jsonResponse({ annotations: [] }, { headers: { ETag: 'two' } }))
+    const queryClient = createTestQueryClient()
+    queryClient.setDefaultOptions({ queries: { retry: false, gcTime: Infinity } })
+    renderWithQuery(<DraftConflictDialog />, queryClient)
+    await waitFor(() =>
+      expect(queryClient.getQueryData(['auth', 'principal-context'])).toBeDefined(),
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: 'Prefer local conflicts' }))
+
+    await waitFor(() => expect(useAnnotationStore.getState().conflict).toBeNull())
+    expect(useAnnotationStore.getState().currentAnnotation?.notes).toBe('unsaved')
+    expect(useAnnotationStore.getState().originalAnnotation?.annotatorId).toBe('principal-one')
+  })
+
+  it.each(['generation', 'other-episode'] as const)(
+    'retains label conflicts after a %s reload race',
+    async (change) => {
+      useEpisodeStore.setState({
+        currentEpisode: {
+          sourceId: 'source',
+          sourceRevision: 'new',
+          meta: { index: 0, length: 10, taskIndex: 0, hasAnnotations: false },
+          cameras: [],
+          videoUrls: {},
+          trajectoryData: [],
+        },
+      })
+      useLabelStore.setState({
+        datasetId: 'ds-1',
+        principalScopeId: 'principal-one',
+        episodeLabels: { 0: ['FAILURE'] },
+        savedEpisodeLabels: {},
+        conflict: {
+          currentEtag: 'one',
+          episodeIndex: change === 'other-episode' ? 1 : 0,
+          submittedLabels: ['FAILURE'],
+          sourceChanged: true,
+        },
+      })
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ scope_id: 'principal-one', auth_mode: 'local' }))
+        .mockImplementationOnce(async () => {
+          if (change === 'generation')
+            act(() =>
+              useLabelStore.setState({
+                editGeneration: useLabelStore.getState().editGeneration + 1,
+              }),
+            )
+          return jsonResponse(
+            { dataset_id: 'ds-1', episodes: {}, available_labels: [] },
+            { headers: { ETag: 'two' } },
+          )
+        })
+      const queryClient = createTestQueryClient()
+      queryClient.setDefaultOptions({ queries: { retry: false, gcTime: Infinity } })
+      renderWithQuery(<DraftConflictDialog />, queryClient)
+      await waitFor(() =>
+        expect(queryClient.getQueryData(['auth', 'principal-context'])).toBeDefined(),
+      )
+
+      await userEvent.click(screen.getByRole('button', { name: 'Prefer local conflicts' }))
+
+      expect(
+        await screen.findByText(
+          change === 'generation'
+            ? /Labels changed while reloading/i
+            : /Open the conflicting episode/i,
+        ),
+      ).toBeVisible()
+      expect(useLabelStore.getState().episodeLabels[0]).toEqual(['FAILURE'])
+      expect(useLabelStore.getState().conflict).not.toBeNull()
+    },
+  )
 
   it.each(['server', 'local'] as const)(
     'explicitly resolves source-changed labels using %s',

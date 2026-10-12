@@ -16,11 +16,313 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Lock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import src.api.services.vlm_judge_service as vjs
 from src.api.config import AppConfig, load_config
+from src.api.services.saved_input_service import SavedInputError, ViewerDatasetResolver
+
+
+@pytest.fixture
+def saved_input_resolver(tmp_path: Path) -> ViewerDatasetResolver:
+    from evaluation.vlm_judge.dataset import EpisodeRecord
+
+    record = EpisodeRecord(
+        "dataset/0",
+        0,
+        "Move the cube",
+        30,
+        30,
+        {"front": tmp_path / "front.mp4", "wrist": tmp_path / "wrist.mp4"},
+        None,
+        None,
+        video_windows={"front": (0.0, 1.0), "wrist": (1.0, 2.0)},
+        media_identity={"front": "front-v1", "wrist": "wrist-v1"},
+    )
+    datasets = SimpleNamespace(
+        get_dataset=AsyncMock(return_value=object()),
+        get_source_revision=AsyncMock(return_value=("source", "revision")),
+        get_episode_media_record=AsyncMock(return_value=record),
+        list_episodes=AsyncMock(return_value=[SimpleNamespace(index=index) for index in [3, 1, 3]]),
+    )
+    annotations = SimpleNamespace(
+        get_annotation_versioned=AsyncMock(return_value=SimpleNamespace(value=None, etag=None)),
+        get_saved_edits=AsyncMock(return_value=SimpleNamespace(value=None, etag=None)),
+    )
+    return ViewerDatasetResolver(datasets, annotations)
+
+
+async def test_given_duplicate_episode_indices_when_selected_then_sorted_and_deduplicated(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    assert await saved_input_resolver.episode_indices("dataset", principal_scope_id="human") == [1, 3]
+
+
+@pytest.mark.parametrize("operation", ["resolve", "episode_indices"])
+async def test_given_missing_dataset_when_resolving_then_not_found(
+    saved_input_resolver: ViewerDatasetResolver,
+    operation: str,
+) -> None:
+    saved_input_resolver.datasets.get_dataset.return_value = None
+    arguments = ("dataset", 0) if operation == "resolve" else ("dataset",)
+
+    with pytest.raises(SavedInputError, match="Dataset not found") as error:
+        await getattr(saved_input_resolver, operation)(*arguments, principal_scope_id="human")
+
+    assert error.value.status_code == 404
+
+
+async def test_given_oversized_selection_when_selected_then_rejected(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    saved_input_resolver.datasets.list_episodes.return_value = [SimpleNamespace(index=0)] * 10001
+
+    with pytest.raises(SavedInputError, match="at most 10000") as error:
+        await saved_input_resolver.episode_indices("dataset", principal_scope_id="human")
+
+    assert error.value.status_code == 422
+
+
+async def test_given_missing_episode_when_resolving_then_not_found(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    saved_input_resolver.datasets.get_episode_media_record.return_value = None
+
+    with pytest.raises(SavedInputError, match="Episode not found") as error:
+        await saved_input_resolver.resolve("dataset", 0, principal_scope_id="human")
+
+    assert error.value.status_code == 404
+
+
+@pytest.mark.parametrize("change", ["missing", "identity", "windows", "instruction"])
+async def test_given_media_changed_during_resolution_when_resolved_then_rejected(
+    saved_input_resolver: ViewerDatasetResolver,
+    change: str,
+) -> None:
+    original = saved_input_resolver.datasets.get_episode_media_record.return_value
+    replacements = {
+        "missing": None,
+        "identity": replace(original, media_identity={"front": "replacement"}),
+        "windows": replace(original, video_windows={"front": (2.0, 3.0)}),
+        "instruction": replace(original, instruction="Replacement instruction"),
+    }
+    saved_input_resolver.datasets.get_episode_media_record.side_effect = [original, replacements[change]]
+
+    with pytest.raises(SavedInputError, match="Media changed"):
+        await saved_input_resolver.resolve("dataset", 0, principal_scope_id="human")
+
+
+@pytest.mark.parametrize("has_identity", [True, False])
+async def test_given_selected_camera_when_resolved_then_only_selected_media_returned(
+    saved_input_resolver: ViewerDatasetResolver,
+    has_identity: bool,
+) -> None:
+    original = saved_input_resolver.datasets.get_episode_media_record.return_value
+    if not has_identity:
+        original = replace(original, media_identity=None)
+        saved_input_resolver.datasets.get_episode_media_record.return_value = original
+
+    record, snapshot = await saved_input_resolver.resolve(
+        "dataset",
+        0,
+        principal_scope_id="human",
+        views=("wrist",),
+    )
+
+    assert record.video_paths == {"wrist": original.video_paths["wrist"]}
+    assert record.video_windows == {"wrist": (1.0, 2.0)}
+    assert record.media_identity == ({"wrist": "wrist-v1"} if has_identity else None)
+    assert record.episode_id == "dataset/episode_000000"
+    assert record.snapshot_id == snapshot.snapshot_id
+    assert snapshot.instruction == "Move the cube"
+
+
+async def test_given_unknown_camera_when_resolved_then_rejected(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    with pytest.raises(SavedInputError, match="Unknown camera") as error:
+        await saved_input_resolver.resolve("dataset", 0, principal_scope_id="human", views=("missing",))
+
+    assert error.value.status_code == 422
+
+
+async def test_given_incomplete_sample_reference_when_validated_then_rejected(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    with pytest.raises(SavedInputError):
+        await saved_input_resolver.validation_sample("dataset", 0, principal_scope_id="human", reference={})
+
+
+@pytest.mark.parametrize("changed", [False, True])
+async def test_given_saved_label_sample_when_validated_then_requires_unchanged_baseline(
+    saved_input_resolver: ViewerDatasetResolver,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: bool,
+) -> None:
+    from evaluation.vlm_judge.curation import DatasetLabelsFile
+    from evaluation.vlm_judge.saved_input import label_baseline
+
+    labels = DatasetLabelsFile(dataset_id="dataset", episodes={"0": ["success"]})
+    replacement = DatasetLabelsFile(dataset_id="dataset", episodes={"0": ["failure"]}) if changed else labels
+    storage = SimpleNamespace(load=AsyncMock(side_effect=[labels, replacement]))
+    monkeypatch.setattr("src.api.routers.labels._get_label_storage", lambda: storage)
+    _, snapshot = await saved_input_resolver.resolve("dataset", 0, principal_scope_id="human")
+    reference = {"snapshot_id": snapshot.snapshot_id, "labels_revision": label_baseline(labels, 0)["revision"]}
+
+    if changed:
+        with pytest.raises(SavedInputError, match="Validation label revision changed"):
+            await saved_input_resolver.validation_sample("dataset", 0, principal_scope_id="human", reference=reference)
+    else:
+        sample = await saved_input_resolver.validation_sample(
+            "dataset",
+            0,
+            principal_scope_id="human",
+            reference=reference,
+        )
+        assert sample["human_outcome"] == "success"
+        assert sample["baseline_source"] == "label"
+        assert sample["reference"] == reference
+
+
+async def test_given_saved_annotation_sample_when_validated_then_returns_saved_outcome(
+    saved_input_resolver: ViewerDatasetResolver,
+) -> None:
+    from src.api.models.annotations import EpisodeAnnotationFile
+
+    annotation = EpisodeAnnotationFile.model_validate(
+        {
+            "dataset_id": "dataset",
+            "episode_index": 0,
+            "annotations": [
+                {
+                    "annotator_id": "human",
+                    "language_instruction": {"instruction": "Move the cube", "source": "human"},
+                    "task_completeness": {"rating": "success", "confidence": 4},
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "trajectory_quality": {
+                        "overall_score": 4,
+                        "metrics": {
+                            "smoothness": 4,
+                            "efficiency": 4,
+                            "safety": 4,
+                            "precision": 4,
+                        },
+                    },
+                    "data_quality": {"overall_quality": "good"},
+                    "anomalies": {"anomalies": []},
+                }
+            ],
+        }
+    )
+    saved_input_resolver.annotations.get_annotation_versioned.return_value = SimpleNamespace(
+        value=annotation,
+        etag='"annotation-v1"',
+    )
+    _, snapshot = await saved_input_resolver.resolve("dataset", 0, principal_scope_id="human")
+    reference = {
+        "snapshot_id": snapshot.snapshot_id,
+        "annotation_author_id": "human",
+        "annotation_revision": '"annotation-v1"',
+    }
+
+    sample = await saved_input_resolver.validation_sample("dataset", 0, principal_scope_id="human", reference=reference)
+
+    assert sample["human_outcome"] == "success"
+    assert sample["input"]["instruction"] == "Move the cube"
+
+
+@pytest.mark.parametrize("failure", ["episode", "changed", "unknown-view", "source", "storage"])
+async def test_given_invalid_saved_judge_input_when_router_resolves_then_safe_status(
+    saved_input_resolver: ViewerDatasetResolver,
+    failure: str,
+) -> None:
+    from fastapi import HTTPException
+
+    from src.api.routers.vlm_judge import _resolve_saved_episode
+    from src.api.storage import StorageError
+
+    datasets = saved_input_resolver.datasets
+    if failure == "episode":
+        datasets.get_episode_media_record.return_value = None
+    elif failure == "changed":
+        original = datasets.get_episode_media_record.return_value
+        datasets.get_episode_media_record.side_effect = [original, replace(original, instruction="Changed")]
+    elif failure == "source":
+        datasets.get_source_revision.side_effect = ValueError("private-source-detail")
+    elif failure == "storage":
+        datasets.get_episode_media_record.side_effect = StorageError("private-storage-detail")
+
+    with pytest.raises(HTTPException) as error:
+        await _resolve_saved_episode(
+            datasets,
+            saved_input_resolver.annotations,
+            "dataset",
+            0,
+            "human",
+            views=("missing",) if failure == "unknown-view" else (),
+        )
+
+    assert (
+        error.value.status_code
+        == {"episode": 404, "changed": 409, "unknown-view": 422, "source": 409, "storage": 503}[failure]
+    )
+    assert "private-" not in str(error.value.detail)
+
+
+@pytest.mark.parametrize("identity", [True, False])
+async def test_given_selected_judge_view_when_router_resolves_then_media_filtered(
+    saved_input_resolver: ViewerDatasetResolver,
+    identity: bool,
+) -> None:
+    from src.api.routers.vlm_judge import _resolve_saved_episode
+
+    if not identity:
+        datasets = saved_input_resolver.datasets
+        datasets.get_episode_media_record.return_value = replace(
+            datasets.get_episode_media_record.return_value, media_identity=None
+        )
+
+    record, snapshot = await _resolve_saved_episode(
+        saved_input_resolver.datasets,
+        saved_input_resolver.annotations,
+        "dataset",
+        0,
+        "human",
+        views=("front",),
+    )
+
+    assert list(record.video_paths) == ["front"]
+    assert record.video_windows == {"front": (0.0, 1.0)}
+    assert record.media_identity == ({"front": "front-v1"} if identity else None)
+    assert snapshot.instruction == record.instruction
+
+
+def test_given_disabled_judge_when_preparing_configuration_then_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(vjs, "get_app_config", lambda: _config(monkeypatch, enabled=False))
+
+    with pytest.raises(HTTPException) as error:
+        vjs.prepare_job_configuration({})
+
+    assert error.value.status_code == 503
+
+
+async def test_given_azure_without_provider_when_creating_judge_jobs_then_unavailable(
+    saved_input_resolver: ViewerDatasetResolver,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    config = replace(_config(monkeypatch, enabled=True), storage_backend="azure")
+    saved_input_resolver.datasets._blob_provider = None
+
+    with pytest.raises(HTTPException) as error:
+        await vjs.create_judge_jobs(config, saved_input_resolver.datasets, saved_input_resolver.annotations)
+
+    assert error.value.status_code == 503
 
 
 @pytest.fixture(autouse=True)

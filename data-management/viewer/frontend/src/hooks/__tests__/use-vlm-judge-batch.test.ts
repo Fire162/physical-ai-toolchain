@@ -195,6 +195,116 @@ describe('useJudgeSamples', () => {
 })
 
 describe('useVlmJudgeBatch', () => {
+  it.each([false, true])(
+    'pages inventory and stops safely on an empty page: %s',
+    async (emptyPage) => {
+      mockFetch.mockImplementation(async (url: string) => {
+        const target = String(url)
+        if (target.includes('/judge/episodes')) {
+          const offset = new URL(target, 'http://localhost').searchParams.get('offset')
+          return jsonResponse({
+            dataset_id: 'ds-1',
+            snapshot_id: 'inventory',
+            total: 3,
+            items: offset === '0' ? [0, 4] : emptyPage ? [] : [9],
+          })
+        }
+        if (target.includes('/resets?')) return jsonResponse({ detail: 'Missing' }, 404)
+        return jsonResponse({ items: [], total: 0 })
+      })
+      const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', true), {
+        queryClient,
+      })
+
+      await waitFor(() =>
+        expect(result.current.inventory.data?.items).toEqual(emptyPage ? [0, 4] : [0, 4, 9]),
+      )
+
+      expect(
+        mockFetch.mock.calls.filter(([url]) => String(url).includes('/judge/episodes')),
+      ).toHaveLength(2)
+      expect(
+        mockFetch.mock.calls.some(
+          ([url]) =>
+            String(url).includes('offset=2') && String(url).includes('snapshot_id=inventory'),
+        ),
+      ).toBe(true)
+    },
+  )
+
+  it('refreshes scoped state after a durable dataset action succeeds', async () => {
+    useDatasetStore.setState({
+      currentDataset: {
+        id: 'ds-1',
+        name: 'Synthetic',
+        totalEpisodes: 1,
+        fps: 30,
+        features: {},
+        tasks: [],
+      },
+    })
+    mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/csrf-token')) return jsonResponse({ csrf_token: TEST_CSRF_TOKEN })
+      if (init?.method === 'POST') return jsonResponse({ id: 'durable', status: 'cancelled' })
+      if (String(url).includes('/resets?')) return jsonResponse({ detail: 'Missing' }, 404)
+      return jsonResponse({ items: [], total: 0 })
+    })
+    const { result } = renderHookWithProviders(() => useJudgeDataset('ds-1', true), { queryClient })
+    await waitFor(() => expect(result.current.inventory.isSuccess).toBe(true))
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    await act(async () => {
+      await result.current.act({ kind: 'cancel', jobId: 'durable' })
+    })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['labels', 'ds-1'] })
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ['judge-evidence', 'ds-1', 'principal-one'],
+    })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['vlm-judge', 'ds-1'] })
+    act(() => result.current.refresh())
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ['judge-dataset', 'ds-1', 'principal-one', undefined, undefined],
+    })
+  })
+
+  it.each([null, 'ds-1'])('rejects empty batch selection for dataset %s', async (datasetId) => {
+    const { result } = renderHookWithProviders(() => useVlmJudgeBatch(datasetId), { queryClient })
+
+    await act(async () => {
+      await expect(
+        result.current.submit({ indices: datasetId ? [] : [0], mode: 'judge' }),
+      ).rejects.toThrow('Select actual episode IDs')
+    })
+
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it.each(['snapshot', 'annotation'])(
+    'rejects a replaced grounding %s reference before submitting',
+    async (changedField) => {
+      routeFetch({ 0: true })
+      const { result } = renderHookWithProviders(() => useVlmJudgeBatch('ds-1'), { queryClient })
+
+      await act(async () => {
+        await expect(
+          result.current.submit({
+            indices: [0],
+            mode: 'sample',
+            samples: {
+              0: {
+                snapshotId: changedField === 'snapshot' ? 'old' : 'a'.repeat(64),
+                annotationRevision: changedField === 'annotation' ? 'old' : undefined,
+              },
+            },
+          }),
+        ).rejects.toThrow('Validation sample changed')
+      })
+
+      expect(mockFetch.mock.calls.some(([url]) => String(url).endsWith('/judge/jobs'))).toBe(false)
+    },
+  )
+
   it('loads annotated and usable grounding episodes in one request', async () => {
     mockFetch.mockImplementation(async (url: string) => {
       const target = String(url)

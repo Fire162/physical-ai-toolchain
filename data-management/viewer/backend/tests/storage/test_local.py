@@ -22,6 +22,27 @@ from src.api.validation import validate_path_containment
 from .conftest import create_test_annotation
 
 
+async def test_given_malformed_revision_entries_when_listing_then_only_valid_episodes_returned(tmp_path: Path) -> None:
+    directory = tmp_path / "ds" / "annotations" / "episodes"
+    directory.mkdir(parents=True)
+    for filename in ["episode_000003.json", "episode_invalid.json", "unrelated.json", "episode_4.txt"]:
+        (directory / filename).write_text("{}")
+
+    revisions = await LocalStorageAdapter(str(tmp_path)).list_annotation_revisions("ds")
+
+    assert list(revisions) == [3]
+    assert revisions[3]
+
+
+async def test_given_revision_directory_unreadable_when_listing_then_storage_error(tmp_path: Path) -> None:
+    directory = tmp_path / "ds" / "annotations" / "episodes"
+    directory.parent.mkdir(parents=True)
+    directory.write_text("not a directory")
+
+    with pytest.raises(StorageError):
+        await LocalStorageAdapter(str(tmp_path)).list_annotation_revisions("ds")
+
+
 def _competing_local_writer(base: str, kind: str, barrier: Barrier, result: Connection, name: str) -> None:
     async def write() -> list[bool]:
         outcomes = []

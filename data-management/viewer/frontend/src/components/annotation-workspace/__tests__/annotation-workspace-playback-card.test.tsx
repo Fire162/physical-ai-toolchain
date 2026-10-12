@@ -41,6 +41,133 @@ function renderPlaybackCard(overrides: Record<string, unknown> = {}) {
 }
 
 describe('AnnotationWorkspacePlaybackCard', () => {
+  it.each([false, true])('handles a follower play failure after unmount=%s', async (unmounted) => {
+    const onTogglePlayback = vi.fn()
+    const { container, unmount } = renderPlaybackCard({
+      cameras: ['wrist', 'overhead'],
+      selectedCameras: ['wrist', 'overhead'],
+      videoSrc: '/wrist.mp4',
+      videoUrls: { wrist: '/wrist.mp4', overhead: '/overhead.mp4' },
+      isPlaying: true,
+      onTogglePlayback,
+    })
+    const follower = container.querySelector<HTMLVideoElement>('video[data-camera="overhead"]')!
+    let rejectPlay!: (cause: Error) => void
+    vi.spyOn(follower, 'play').mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectPlay = reject
+      }),
+    )
+    fireEvent.loadedMetadata(follower)
+    if (unmounted) unmount()
+
+    await act(async () => rejectPlay(new Error('Synthetic decoder failure')))
+
+    if (unmounted) expect(onTogglePlayback).not.toHaveBeenCalled()
+    else {
+      expect(screen.getByText('overhead: video unavailable')).toBeVisible()
+      expect(onTogglePlayback).toHaveBeenCalledOnce()
+      fireEvent.error(follower)
+      expect(onTogglePlayback).toHaveBeenCalledOnce()
+    }
+  })
+
+  it.each([Number.NaN, 0, 0.1])(
+    'synchronizes followers without timing windows (duration=%s)',
+    (duration) => {
+      const { container } = renderPlaybackCard({
+        cameras: ['wrist', 'overhead'],
+        selectedCameras: ['wrist', 'overhead'],
+        videoSrc: '/wrist.mp4',
+        videoUrls: { wrist: '/wrist.mp4', overhead: '/overhead.mp4' },
+        currentFrame: 30,
+        originalFrameIndex: null,
+        sourceFrameCount: 0,
+        datasetFps: 30,
+      })
+      const follower = container.querySelector<HTMLVideoElement>('video[data-camera="overhead"]')!
+      vi.spyOn(follower, 'duration', 'get').mockReturnValue(duration)
+      const pause = vi.spyOn(follower, 'pause')
+
+      fireEvent.loadedMetadata(follower)
+
+      expect(follower.currentTime).toBeCloseTo(duration > 0 ? duration - 0.001 : 1)
+      expect(follower.playbackRate).toBe(1)
+      expect(pause).toHaveBeenCalled()
+    },
+  )
+
+  it('does not restart an already-playing follower or seek within the frame tolerance', () => {
+    const { container } = renderPlaybackCard({
+      cameras: ['wrist', 'overhead'],
+      selectedCameras: ['wrist', 'overhead'],
+      videoSrc: '/wrist.mp4',
+      videoUrls: { wrist: '/wrist.mp4', overhead: '/overhead.mp4' },
+      currentFrame: 0,
+      originalFrameIndex: 0,
+      isPlaying: true,
+      datasetFps: 30,
+    })
+    const follower = container.querySelector<HTMLVideoElement>('video[data-camera="overhead"]')!
+    vi.spyOn(follower, 'paused', 'get').mockReturnValue(false)
+    const play = vi.spyOn(follower, 'play')
+    follower.currentTime = 0.01
+
+    fireEvent.loadedMetadata(follower)
+
+    expect(follower.currentTime).toBe(0.01)
+    expect(play).not.toHaveBeenCalled()
+  })
+
+  it('keeps hidden-document followers paused even when playback is active', () => {
+    const { container } = renderPlaybackCard({
+      cameras: ['wrist', 'overhead'],
+      selectedCameras: ['wrist', 'overhead'],
+      videoSrc: '/wrist.mp4',
+      videoUrls: { wrist: '/wrist.mp4', overhead: '/overhead.mp4' },
+      currentFrame: 0,
+      originalFrameIndex: 0,
+      isPlaying: true,
+    })
+    const follower = container.querySelector<HTMLVideoElement>('video[data-camera="overhead"]')!
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    const play = vi.spyOn(follower, 'play')
+    const pause = vi.spyOn(follower, 'pause')
+
+    fireEvent.loadedMetadata(follower)
+
+    expect(play).not.toHaveBeenCalled()
+    expect(pause).toHaveBeenCalled()
+  })
+
+  it('clears failed primary media after metadata recovery and releases its ref on unmount', () => {
+    const videoRef = createRef<HTMLVideoElement>()
+    const { container, unmount } = renderPlaybackCard({ videoRef, videoSrc: '/wrist.mp4' })
+    const primary = container.querySelector('video')!
+    fireEvent.error(primary)
+    fireEvent.error(primary)
+    expect(screen.getByText('wrist: video unavailable')).toBeVisible()
+
+    fireEvent.loadedMetadata(primary)
+
+    expect(screen.queryByText('wrist: video unavailable')).not.toBeInTheDocument()
+    expect(videoRef.current).toBe(primary)
+    unmount()
+    expect(videoRef.current).toBeNull()
+  })
+
+  it('renders only the primary video when no explicit camera selection exists', () => {
+    const { container } = renderPlaybackCard({
+      videoSrc: '/wrist.mp4',
+      videoUrls: { wrist: '/wrist.mp4', overhead: '/overhead.mp4', front: '' },
+      selectedCameras: undefined,
+    })
+
+    expect(
+      Array.from(container.querySelectorAll('video')).map((video) => video.dataset.camera),
+    ).toEqual(['wrist'])
+  })
+
   it('recognizes already-ready media without showing a delayed loading overlay', () => {
     const readyState = vi.spyOn(HTMLMediaElement.prototype, 'readyState', 'get').mockReturnValue(1)
     renderPlaybackCard({ videoSrc: '/ready.mp4', frameImageUrl: null })
@@ -203,6 +330,7 @@ describe('AnnotationWorkspacePlaybackCard', () => {
   })
 
   afterEach(() => {
+    vi.restoreAllMocks()
     vi.useRealTimers()
   })
 

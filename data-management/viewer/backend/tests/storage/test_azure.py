@@ -14,6 +14,31 @@ import pytest
 from .conftest import create_test_annotation
 
 
+@pytest.mark.parametrize("http_error", [False, True])
+async def test_given_revision_listing_failure_when_reading_then_storage_error(
+    monkeypatch: pytest.MonkeyPatch,
+    http_error: bool,
+) -> None:
+    from azure.core.exceptions import HttpResponseError
+
+    from src.api.storage import azure
+
+    monkeypatch.setattr(azure, "AZURE_AVAILABLE", True)
+    error = HttpResponseError("Synthetic listing failure") if http_error else OSError("Synthetic listing failure")
+    if http_error:
+        error.status_code = 503
+        error.error_code = "ServiceUnavailable"
+    client = MagicMock()
+    client.get_container_client.return_value.list_blobs.side_effect = error
+    adapter = azure.AzureBlobStorageAdapter(account_name="testaccount", container_name="datasets", sas_token="test")
+    adapter._client = client
+
+    with pytest.raises(azure.StorageError) as failure:
+        await adapter.list_annotation_revisions("ds")
+
+    assert failure.value.cause is error
+
+
 @pytest.mark.parametrize(
     ("status", "code", "create_only", "conflict"),
     [
@@ -269,6 +294,7 @@ class TestAzureBlobStorageAdapter:
             ("test-dataset/annotations/episodes/episode_000003.json", '"etag-3"'),
             ("test-dataset/annotations/episodes/episode_bad.json", '"skip"'),
             ("test-dataset/annotations/episodes/episode_000001.json", None),
+            ("test-dataset/annotations/episodes/episode_000002.txt", '"skip"'),
         ):
             blob = MagicMock()
             blob.name = name
