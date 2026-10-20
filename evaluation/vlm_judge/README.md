@@ -1,7 +1,7 @@
 ---
 title: VLM-as-Judge
 description: Run vision-language evaluations with saved inputs, approval-gated jobs and confined HTTP media access
-ms.date: 2026-10-16
+ms.date: 2026-10-19
 ---
 
 Open-weight-first harness that scores LeRobot manipulation episodes and
@@ -75,6 +75,9 @@ the CLI and the HTTP API import the service — no parallel paths.
 | `policy_eval.py`                      | CLI: judge a directory of policy-rollout MP4s             |
 | `data-management/curation/scripts/`   | Dataset recipes and standalone curation HTTP launcher     |
 | `scripts/evaluate-policy-rollouts.sh` | Wrapper for policy rollout dirs (`leisaac-tests/*`)       |
+| `scripts/submit-osmo-judge.sh`        | Submit the judge as an OSMO workflow                      |
+| `scripts/osmo-judge-entry.sh`         | OSMO task entry: locked runtime, judge, verdict check     |
+| `workflows/osmo/judge.yaml`           | OSMO workflow template                                    |
 
 ## 🚀 Quick Start
 
@@ -374,6 +377,33 @@ No Entra registration is required for trusted-local mode. It is not authenticati
 shared hosts, LAN listeners, container port publishing, proxies, dev tunnels and port
 forwarding are unsupported. A local forwarding process can appear to be a local caller.
 Dataset writers must be trusted; file replacement races are not prevented.
+
+## 📡 OSMO Workflow
+
+`scripts/submit-osmo-judge.sh` runs the judge as an OSMO workflow on one GPU. The task installs the judge's locked runtime, judges its input, checks that every verdict has an outcome, a confidence, and per-frame progress, and writes `judgments.jsonl` to the task output. `--output-dataset NAME` also publishes the verdicts as a version of an OSMO dataset.
+
+The judge writes its verdicts to `judgments.partial.jsonl`, and the task renames that file to `judgments.jsonl` only after every selected episode or video was judged and every verdict passed the check. A failed, interrupted, or killed run leaves at most `judgments.partial.jsonl`, and a failed task still logs a summary of the verdicts it wrote.
+
+An inconclusive verdict, where the outcome votes tie, has a `null` outcome; it counts as a complete verdict, and the task log reports how many verdicts were inconclusive.
+
+The input decides what the judge scores. A LeRobot dataset brings its episodes and instructions. Any other directory is judged as rollout videos, which need `--instruction`.
+
+| Option            | Input                                                                                                                |
+|-------------------|----------------------------------------------------------------------------------------------------------------------|
+| `--local-dataset` | A dataset in the workstation's datasets directory, on the [local OSMO profile](../../infrastructure/local/README.md) |
+| `--input-dataset` | An OSMO dataset, such as the replay videos that `submit-osmo-eval.sh --output-dataset` publishes                     |
+| `--input-url`     | An object-store URL that OSMO downloads                                                                              |
+
+The default model is `Qwen/Qwen3-VL-4B-Instruct` at a pinned commit. Another Hub model needs `--model-revision`, and a model directory inside the task, given as an absolute path, loads offline without one. On the local profile, the model downloads once into the job cache and later runs reuse it.
+
+```bash
+# Judge the episodes of a local dataset
+evaluation/vlm_judge/scripts/submit-osmo-judge.sh --profile local --local-dataset so101-learner
+
+# Judge the replay videos of an Isaac Lab evaluation
+evaluation/vlm_judge/scripts/submit-osmo-judge.sh --profile local \
+  --input-dataset cartpole-eval --instruction "Keep the pole balanced upright"
+```
 
 ## 📤 Output
 
