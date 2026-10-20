@@ -1,4 +1,4 @@
-"""LeRobot dataset adapter for VLM-as-judge evaluation.
+"""LeRobot metadata shared by curation and evaluation.
 
 Resolves a LeRobot dataset directory into an iterable of ``EpisodeRecord``
 entries, each carrying the per-view MP4 paths, the language instruction,
@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,9 @@ class EpisodeRecord:
     video_paths: dict[str, Path]
     from_timestamp: float | None
     to_timestamp: float | None
+    video_windows: dict[str, tuple[float, float]] = field(default_factory=dict)
+    media_identity: dict[str, str] | None = None
+    snapshot_id: str | None = None
 
     @property
     def duration_s(self) -> float:
@@ -87,12 +90,15 @@ def iter_episodes(
     views: tuple[str, ...] | None = None,
     limit: int | None = None,
     indices: list[int] | None = None,
+    video_validator: Callable[[Path], Path] | None = None,
 ) -> Iterator[EpisodeRecord]:
     """Yield ``EpisodeRecord`` entries for every episode in the dataset.
 
     ``views`` filters which video keys (e.g. ``observation.images.front``) are
     returned; ``None`` keeps every video stream. ``indices`` restricts the
     iteration to a specific list of episode indices. ``limit`` caps the count.
+    HTTP callers supply ``video_validator`` to confine media before probes;
+    trusted CLI callers retain the default filesystem behavior.
     """
     spec = load_dataset_spec(root)
     selected_views = _resolve_views(spec, views)
@@ -102,7 +108,11 @@ def iter_episodes(
         # others use jsonl with one-mp4-per-episode layout. Detect by metadata
         # file presence.
         parquet_meta = sorted((spec.root / "meta" / "episodes").rglob("file-*.parquet"))
-        records = _iter_v3(spec, selected_views) if parquet_meta else _iter_v3_jsonl(spec, selected_views)
+        records = (
+            _iter_v3(spec, selected_views)
+            if parquet_meta
+            else _iter_v3_jsonl(spec, selected_views, indices=indices, video_validator=video_validator)
+        )
     else:
         records = _iter_v21(spec, selected_views)
 
@@ -110,6 +120,10 @@ def iter_episodes(
     for record in records:
         if indices is not None and record.episode_index not in indices:
             continue
+        if video_validator is not None:
+            record = replace(
+                record, video_paths={view: video_validator(path) for view, path in record.video_paths.items()}
+            )
         yield record
         yielded += 1
         if limit is not None and yielded >= limit:
@@ -211,6 +225,7 @@ def _iter_v3(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[EpisodeRecor
             length = int(row["length"])
             instruction = _resolve_instruction_v3(row, tasks_by_index)
             video_paths: dict[str, Path] = {}
+            video_windows = {}
             from_ts: float | None = None
             to_ts: float | None = None
             for view in views:
@@ -218,6 +233,7 @@ def _iter_v3(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[EpisodeRecor
                 v_file = int(row[f"videos/{view}/file_index"])
                 from_ts = float(row[f"videos/{view}/from_timestamp"])
                 to_ts = float(row[f"videos/{view}/to_timestamp"])
+                video_windows[view] = (from_ts, to_ts)
                 video_paths[view] = spec.root / spec.video_path.format(
                     chunk_index=v_chunk,
                     file_index=v_file,
@@ -232,6 +248,7 @@ def _iter_v3(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[EpisodeRecor
                 video_paths=video_paths,
                 from_timestamp=from_ts,
                 to_timestamp=to_ts,
+                video_windows=video_windows,
             )
 
 
@@ -240,7 +257,13 @@ def _iter_v3(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[EpisodeRecor
 # -------------------------------------------------------------------------
 
 
-def _iter_v3_jsonl(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[EpisodeRecord]:
+def _iter_v3_jsonl(
+    spec: DatasetSpec,
+    views: tuple[str, ...],
+    *,
+    indices: list[int] | None = None,
+    video_validator: Callable[[Path], Path] | None = None,
+) -> Iterator[EpisodeRecord]:
     ep_meta_dir = spec.root / "meta" / "episodes"
     ep_files = sorted(ep_meta_dir.rglob("episode_*.jsonl"))
     if not ep_files:
@@ -261,6 +284,8 @@ def _iter_v3_jsonl(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[Episod
                     continue
                 payload = _normalize_tasks_field(json.loads(line))
                 ep_idx = int(payload["episode_index"])
+                if indices is not None and ep_idx not in indices:
+                    continue
                 length = int(payload.get("length", 0))
                 instruction = _resolve_instruction_v21(payload, tasks_by_index)
                 video_paths: dict[str, Path] = {}
@@ -272,7 +297,9 @@ def _iter_v3_jsonl(spec: DatasetSpec, views: tuple[str, ...]) -> Iterator[Episod
                             f"No videos_path template for view {view!r} in info.json features",
                         )
                     candidate = spec.root / template.format(episode_index=ep_idx)
-                    if not candidate.exists():
+                    if video_validator is not None:
+                        candidate = video_validator(candidate)
+                    elif not candidate.exists():
                         missing_views.append(view)
                     video_paths[view] = candidate
                 if missing_views:
